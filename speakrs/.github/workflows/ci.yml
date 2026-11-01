@@ -1,0 +1,399 @@
+name: CI
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+      - update-crates
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Keep in sync with HF_REVISION in src/models.rs
+  SPEAKRS_MODEL_FIXTURE_REV: 67f963b6a1d94fcd4678948237b3cc8bd69bf1d8
+
+jobs:
+  cargo-deny:
+    name: Cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@1.96
+
+      # a prebuilt binary instead of cargo-deny-action, whose Docker build fails
+      # whenever Docker Hub rate-limits or times out the runner
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Check dependency policy
+        run: cargo deny --no-default-features --features online,cpu,cuda,migraphx,load-dynamic,_metrics check
+
+  msrv:
+    name: MSRV Rust 1.96
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust 1.96
+        uses: dtolnay/rust-toolchain@1.96
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-msrv
+
+      - name: Check crate
+        run: cargo check -p speakrs --features cpu
+
+  clippy:
+    name: Clippy (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            features: cpu cuda migraphx load-dynamic _metrics
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+            features: cpu cuda migraphx load-dynamic _metrics
+          - name: macOS arm64
+            os: macos-15
+            features: cpu coreml cuda migraphx load-dynamic _metrics
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --features "${{ matrix.features }}" -- -D warnings
+
+  backend-features:
+    name: Backend features (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-backend-features
+
+      - name: Check the CPU backend alone
+        run: cargo check -p speakrs --no-default-features --features "online cpu"
+
+      - name: Keep ONNX Runtime and CUDA out of CPU and CoreML dependency trees
+        run: bash scripts/check_cpu_dependencies.sh
+
+      - name: Require a backend feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo check -p speakrs --no-default-features --features "online" 2> no-backend.log; then
+            echo "a build without a backend feature compiled" >&2
+            exit 1
+          fi
+          grep -q "speakrs needs an inference backend" no-backend.log
+
+      - name: Require an ONNX Runtime backend for load-dynamic
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo check -p speakrs --no-default-features --features "online cuda load-dynamic" 2> load-dynamic.log; then
+            echo "load-dynamic compiled without an ONNX Runtime backend" >&2
+            exit 1
+          fi
+          grep -q "only applies to the \`cpu\` and" load-dynamic.log
+
+  cuda-only:
+    name: CUDA without ONNX Runtime (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-cuda-only
+
+      - name: Keep ONNX Runtime out of the dependency tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in ort ort-sys; do
+            if output="$(cargo tree -p speakrs --no-default-features --features "online cuda" -e normal -i "$package" 2>&1)"; then
+              echo "$output"
+              echo "$package is in the cuda-only dependency tree" >&2
+              exit 1
+            fi
+            grep -q "did not match any packages" <<<"$output"
+          done
+
+      - name: Keep ONNX Runtime out of the GPU binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree -p xtask --no-default-features --features cuda -e normal > gpu-dependencies.log
+          if grep -E '(^|[^[:alnum:]_-])ort(-sys)? v' gpu-dependencies.log; then
+            echo "ONNX Runtime is in the GPU binary dependency tree" >&2
+            exit 1
+          fi
+
+      - name: Build the driver-only GPU benchmark binary
+        run: cargo build -p xtask --bin speakrs-bm --no-default-features --features cuda-rtx50
+
+      # the host-only PLDA tests read these
+      - name: Cache PLDA fixtures
+        uses: actions/cache@v6
+        with:
+          path: fixtures/models
+          key: ${{ runner.os }}-speakrs-plda-fixtures-${{ env.SPEAKRS_MODEL_FIXTURE_REV }}
+
+      - name: Download PLDA fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="https://huggingface.co/avencera/speakrs-models/resolve/${SPEAKRS_MODEL_FIXTURE_REV}"
+          files=(
+            plda_lda.npy
+            plda_mean1.npy
+            plda_mean2.npy
+            plda_mu.npy
+            plda_psi.npy
+            plda_tr.npy
+          )
+
+          mkdir -p fixtures/models
+          for file in "${files[@]}"; do
+            path="fixtures/models/${file}"
+            if [[ ! -s "$path" ]]; then
+              curl --retry 3 --retry-delay 5 -LfsS "${base_url}/${file}" -o "$path"
+            fi
+          done
+
+          for file in "${files[@]}"; do
+            test -s "fixtures/models/${file}"
+          done
+
+      # GPU tests skip without an NVIDIA GPU; this builds them and runs the host-only ones
+      - name: Run clippy and tests
+        run: |
+          cargo clippy -p speakrs --all-targets --no-default-features --features "online cuda" -- -D warnings
+          cargo clippy -p speakrs --all-targets --no-default-features --features cuda-v100 -- -D warnings
+          cargo clippy -p speakrs --all-targets --no-default-features --features cuda-sm75 -- -D warnings
+          cargo clippy -p speakrs --all-targets --no-default-features --features cuda-sm120 -- -D warnings
+          cargo clippy -p speakrs --all-targets --no-default-features --features cuda-rtx50 -- -D warnings
+          cargo test -p speakrs --no-default-features --features "online cuda"
+      - name: Check minimal CUDA targets and feature errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          for features in cuda-sm70 cuda-v100 cuda-sm75 cuda-sm80 cuda-sm90 cuda-sm120 cuda-sm80,cuda-sm120 cuda-rtx20 cuda-rtx30 cuda-rtx40 cuda-a100 cuda-rtx50; do
+            cargo check -p speakrs --no-default-features --features "$features"
+            cargo test -p speakrs --no-default-features --features "$features" --lib inference::cuda::tier::tests
+            cargo test -p speakrs --no-default-features --features "$features" --lib inference::cuda::kernels::tests
+            cargo tree -p speakrs --no-default-features --features "$features" -e features -i cudarc > cuda-features.log
+            if grep -E 'cudarc feature "(cublas|cudnn)"' cuda-features.log; then
+              echo "optional CUDA library feature in a minimal backend" >&2
+              exit 1
+            fi
+          done
+          if cargo check -p speakrs --no-default-features --features _cuda 2> cuda-target.log; then
+            echo "internal CUDA backend compiled without a GPU target" >&2
+            exit 1
+          fi
+          grep -F 'CUDA requires a GPU target' cuda-target.log
+
+
+  coreml-only:
+    name: CoreML without ONNX Runtime (macOS arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-coreml-only
+
+      - name: Keep ONNX Runtime out of the dependency tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          for package in ort ort-sys; do
+            if output="$(cargo tree -p speakrs --no-default-features --features "online coreml" -e normal -i "$package" 2>&1)"; then
+              echo "$output"
+              echo "$package is in the coreml-only dependency tree" >&2
+              exit 1
+            fi
+            grep -q "did not match any packages" <<<"$output"
+          done
+
+      - name: Run clippy
+        run: cargo clippy -p speakrs --all-targets --no-default-features --features "online coreml" -- -D warnings
+
+  test:
+    timeout-minutes: 30
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+          - name: Linux arm64
+            os: ubuntu-24.04-arm
+          - name: macOS arm64
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust
+
+      - name: Cache model fixtures
+        uses: actions/cache@v6
+        with:
+          path: fixtures/models
+          key: ${{ runner.os }}-speakrs-model-fixtures-${{ env.SPEAKRS_MODEL_FIXTURE_REV }}
+
+      - name: Download model fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="https://huggingface.co/avencera/speakrs-models/resolve/${SPEAKRS_MODEL_FIXTURE_REV}"
+          files=(
+            plda_lda.npy
+            plda_mean1.npy
+            plda_mean2.npy
+            plda_mu.npy
+            plda_psi.npy
+            plda_tr.npy
+            segmentation-3.0.safetensors
+            wespeaker-multimask-tail.safetensors
+            wespeaker-voxceleb-resnet34.min_num_samples.txt
+          )
+
+          mkdir -p fixtures/models
+          for file in "${files[@]}"; do
+            path="fixtures/models/${file}"
+            if [[ ! -s "$path" ]]; then
+              curl --retry 3 --retry-delay 5 -LfsS "${base_url}/${file}" -o "$path"
+            fi
+          done
+
+          for file in "${files[@]}"; do
+            test -s "fixtures/models/${file}"
+          done
+
+      # the Python crate turns on its platform's GPU backend, and pytest covers it in
+      # the package workflow, so leave it out of the CPU fixture test run
+      - name: Run tests
+        run: cargo test --workspace --exclude speakrs-python
+
+      # hashes and PTX entry points only; the PTX itself is generated on a GPU box
+      - name: Check committed CUDA PTX against the kernel sources
+        if: matrix.name == 'Linux x86_64'
+        run: cargo xtask cuda-kernels check
+
+  no-default-features:
+    timeout-minutes: 30
+    name: Test no-default features (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust-no-default
+
+      - name: Cache model fixtures
+        uses: actions/cache@v6
+        with:
+          path: fixtures/models
+          key: ${{ runner.os }}-speakrs-model-fixtures-${{ env.SPEAKRS_MODEL_FIXTURE_REV }}
+
+      - name: Download model fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="https://huggingface.co/avencera/speakrs-models/resolve/${SPEAKRS_MODEL_FIXTURE_REV}"
+          files=(
+            plda_lda.npy
+            plda_mean1.npy
+            plda_mean2.npy
+            plda_mu.npy
+            plda_psi.npy
+            plda_tr.npy
+            segmentation-3.0.safetensors
+            wespeaker-multimask-tail.safetensors
+            wespeaker-voxceleb-resnet34.min_num_samples.txt
+          )
+
+          mkdir -p fixtures/models
+          for file in "${files[@]}"; do
+            path="fixtures/models/${file}"
+            if [[ ! -s "$path" ]]; then
+              curl --retry 3 --retry-delay 5 -LfsS "${base_url}/${file}" -o "$path"
+            fi
+          done
+
+          for file in "${files[@]}"; do
+            test -s "fixtures/models/${file}"
+          done
+
+      - name: Run no-default-features runtime tests
+        run: cargo test -p speakrs --no-default-features --features "online,cpu"

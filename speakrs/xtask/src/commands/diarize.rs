@@ -1,0 +1,372 @@
+use std::fmt;
+use std::path::PathBuf;
+use std::process::Command;
+use std::str::FromStr;
+use std::time::Instant;
+
+use clap::ValueEnum;
+use color_eyre::eyre::{Result, bail, ensure};
+use speakrs::inference::CoreMlComputeUnits;
+use speakrs::inference::ExecutionMode;
+use speakrs::inference::{EmbeddingModel, SegmentationModel};
+use speakrs::pipeline::{
+    COREML_SEGMENTATION_STEP_SECONDS, CUDA_SEGMENTATION_STEP_SECONDS, DiarizationPipeline,
+    FAST_SEGMENTATION_STEP_SECONDS, RuntimeConfig, SEGMENTATION_STEP_SECONDS,
+};
+
+use crate::wav;
+
+#[derive(Debug, Clone, Copy)]
+pub enum DiarizeMode {
+    Speakrs(SpeakrsMode),
+    Pyannote(PyannoteDevice),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SpeakrsMode {
+    Cpu,
+    Coreml,
+    CoremlFast,
+    Cuda,
+    CudaFast,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PyannoteDevice {
+    Cpu,
+    Mps,
+    Cuda,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum ChunkEmbeddingComputeUnits {
+    #[default]
+    All,
+    #[value(alias = "ane")]
+    CpuAndNeuralEngine,
+    #[value(alias = "cpu")]
+    CpuOnly,
+}
+
+/// Arithmetic precision of a CUDA-mode stage
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CudaPrecision {
+    Tf32,
+    Fp32,
+}
+
+#[cfg(feature = "_cuda")]
+impl CudaPrecision {
+    const fn into_runtime(self) -> speakrs::inference::CudaMath {
+        match self {
+            Self::Tf32 => speakrs::inference::CudaMath::Tf32,
+            Self::Fp32 => speakrs::inference::CudaMath::Fp32,
+        }
+    }
+}
+
+/// Algorithm used only by selected Library LSTM plans
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CudaLstm {
+    Standard,
+    PersistStaticSmallH,
+    PersistDynamic,
+}
+
+#[cfg(feature = "cuda")]
+impl CudaLstm {
+    fn into_runtime(self) -> speakrs::inference::CudaLstmAlgorithm {
+        use speakrs::inference::CudaLstmAlgorithm;
+        match self {
+            Self::Standard => CudaLstmAlgorithm::Standard,
+            Self::PersistStaticSmallH => CudaLstmAlgorithm::PersistStaticSmallH,
+            Self::PersistDynamic => CudaLstmAlgorithm::PersistDynamic,
+        }
+    }
+}
+
+/// Runtime options the diarize command passes to the models
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeOptions {
+    pub chunk_emb_compute_units: ChunkEmbeddingComputeUnits,
+    pub cuda_segmentation_math: CudaPrecision,
+    pub cuda_embedding_math: CudaPrecision,
+    #[cfg(feature = "cuda")]
+    pub cuda_lstm_algorithm: CudaLstm,
+}
+
+impl ChunkEmbeddingComputeUnits {
+    const fn into_runtime(self) -> CoreMlComputeUnits {
+        match self {
+            Self::All => CoreMlComputeUnits::All,
+            Self::CpuAndNeuralEngine => CoreMlComputeUnits::CpuAndNeuralEngine,
+            Self::CpuOnly => CoreMlComputeUnits::CpuOnly,
+        }
+    }
+}
+
+impl SpeakrsMode {
+    fn execution_mode(self) -> ExecutionMode {
+        match self {
+            Self::Cpu => ExecutionMode::Cpu,
+            Self::Coreml => ExecutionMode::CoreMl,
+            Self::CoremlFast => ExecutionMode::CoreMlFast,
+            Self::Cuda => ExecutionMode::Cuda,
+            Self::CudaFast => ExecutionMode::CudaFast,
+        }
+    }
+
+    fn step_seconds(self) -> f64 {
+        match self {
+            Self::CoremlFast | Self::CudaFast => FAST_SEGMENTATION_STEP_SECONDS,
+            Self::Coreml => COREML_SEGMENTATION_STEP_SECONDS,
+            Self::Cuda => CUDA_SEGMENTATION_STEP_SECONDS,
+            Self::Cpu => SEGMENTATION_STEP_SECONDS,
+        }
+    }
+}
+
+impl PyannoteDevice {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Mps => "mps",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+impl FromStr for DiarizeMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "cpu" => Ok(Self::Speakrs(SpeakrsMode::Cpu)),
+            "coreml" => Ok(Self::Speakrs(SpeakrsMode::Coreml)),
+            "coreml-fast" => Ok(Self::Speakrs(SpeakrsMode::CoremlFast)),
+            "cuda" => Ok(Self::Speakrs(SpeakrsMode::Cuda)),
+            "cuda-fast" => Ok(Self::Speakrs(SpeakrsMode::CudaFast)),
+            "pyannote-cpu" => Ok(Self::Pyannote(PyannoteDevice::Cpu)),
+            "pyannote-mps" => Ok(Self::Pyannote(PyannoteDevice::Mps)),
+            "pyannote-cuda" => Ok(Self::Pyannote(PyannoteDevice::Cuda)),
+            _ => Err(format!(
+                "unknown mode '{s}', expected one of: cpu, coreml, coreml-fast, cuda, cuda-fast, pyannote-cpu, pyannote-mps, pyannote-cuda"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for DiarizeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Speakrs(SpeakrsMode::Cpu) => write!(f, "cpu"),
+            Self::Speakrs(SpeakrsMode::Coreml) => write!(f, "coreml"),
+            Self::Speakrs(SpeakrsMode::CoremlFast) => write!(f, "coreml-fast"),
+            Self::Speakrs(SpeakrsMode::Cuda) => write!(f, "cuda"),
+            Self::Speakrs(SpeakrsMode::CudaFast) => write!(f, "cuda-fast"),
+            Self::Pyannote(PyannoteDevice::Cpu) => write!(f, "pyannote-cpu"),
+            Self::Pyannote(PyannoteDevice::Mps) => write!(f, "pyannote-mps"),
+            Self::Pyannote(PyannoteDevice::Cuda) => write!(f, "pyannote-cuda"),
+        }
+    }
+}
+
+pub fn run(
+    mode: DiarizeMode,
+    models_dir: Option<PathBuf>,
+    options: RuntimeOptions,
+    wav_files: Vec<PathBuf>,
+) -> Result<()> {
+    let RuntimeOptions {
+        chunk_emb_compute_units,
+        cuda_segmentation_math,
+        cuda_embedding_math,
+        #[cfg(feature = "cuda")]
+        cuda_lstm_algorithm,
+    } = options;
+    let command_start = Instant::now();
+
+    ensure!(!wav_files.is_empty(), "no WAV files specified");
+
+    match mode {
+        DiarizeMode::Pyannote(device) => {
+            let wav_path = wav_files[0].to_string_lossy();
+            let output = run_pyannote_sidecar(device.as_str(), &wav_path)?;
+            print!("{output}");
+        }
+        DiarizeMode::Speakrs(speakrs_mode) => {
+            let execution_mode = speakrs_mode.execution_mode();
+
+            let compute_units = chunk_emb_compute_units.into_runtime();
+            let runtime_config = RuntimeConfig {
+                #[cfg(feature = "coreml")]
+                chunk_emb_compute_units: compute_units,
+                #[cfg(feature = "_cuda")]
+                cuda_segmentation_math: cuda_segmentation_math.into_runtime(),
+                #[cfg(feature = "_cuda")]
+                cuda_embedding_math: cuda_embedding_math.into_runtime(),
+                #[cfg(feature = "cuda")]
+                cuda_lstm_algorithm: cuda_lstm_algorithm.into_runtime(),
+                experiment: None,
+                ..RuntimeConfig::default()
+            };
+            #[cfg(not(feature = "_cuda"))]
+            let _ = (cuda_segmentation_math, cuda_embedding_math);
+            if speakrs_mode.execution_mode().is_cuda() {
+                eprintln!(
+                    "runtime config: cuda_segmentation_math={cuda_segmentation_math:?} cuda_embedding_math={cuda_embedding_math:?}"
+                );
+            }
+            if compute_units != CoreMlComputeUnits::All {
+                eprintln!("runtime config: compute_units={chunk_emb_compute_units:?}");
+            }
+
+            let models_dir_start = Instant::now();
+            let models_dir = models_dir.unwrap_or_else(default_models_dir);
+            let models_dir_elapsed = models_dir_start.elapsed();
+
+            let step = speakrs_mode.step_seconds();
+            let seg_model_start = Instant::now();
+            let mut seg_model = SegmentationModel::with_mode_and_config(
+                models_dir.join("segmentation-3.0.onnx"),
+                step as f32,
+                execution_mode,
+                &runtime_config,
+            )?;
+            let seg_model_elapsed = seg_model_start.elapsed();
+
+            let emb_model_start = Instant::now();
+            let mut emb_model = EmbeddingModel::with_mode_and_config(
+                models_dir.join("wespeaker-voxceleb-resnet34.onnx"),
+                execution_mode,
+                &runtime_config,
+            )?;
+            let emb_model_elapsed = emb_model_start.elapsed();
+
+            let pipeline_start = Instant::now();
+            let mut pipeline =
+                DiarizationPipeline::new(&mut seg_model, &mut emb_model, &models_dir)?;
+            let pipeline_elapsed = pipeline_start.elapsed();
+
+            let loop_start = Instant::now();
+            tracing::trace!(
+                models_dir_ms = models_dir_elapsed.as_millis(),
+                seg_model_ms = seg_model_elapsed.as_millis(),
+                emb_model_ms = emb_model_elapsed.as_millis(),
+                pipeline_ms = pipeline_elapsed.as_millis(),
+                startup_ms = loop_start.duration_since(command_start).as_millis(),
+                "Startup timing",
+            );
+
+            let total = wav_files.len();
+
+            let mut batch_start = Instant::now();
+            let results = if matches!(
+                execution_mode,
+                ExecutionMode::CoreMl | ExecutionMode::CoreMlFast
+            ) {
+                // preserve CoreML's cross-file chunk schedule and load-first behavior
+                let load_start = Instant::now();
+                let mut audio_data = Vec::with_capacity(total);
+                for wav_path in &wav_files {
+                    let file_id = wav_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "file1".to_string());
+                    let (audio, sr) = wav::load_wav_samples(&wav_path.to_string_lossy())?;
+                    ensure!(sr == 16000, "expected 16kHz WAV, got {sr}Hz");
+                    audio_data.push(speakrs::pipeline::OwnedBatchInput { file_id, audio });
+                }
+                tracing::trace!(
+                    load_ms = load_start.elapsed().as_millis(),
+                    files = total,
+                    "All audio loaded"
+                );
+                batch_start = Instant::now();
+                pipeline.run_batch_stream(audio_data.into_iter().map(Ok::<_, color_eyre::Report>))
+            } else {
+                let decoder = wav::WavBatchDecoder::new(wav_files.clone())?;
+                pipeline.run_batch_stream(decoder)
+            }
+            .map_err(|error| match error {
+                speakrs::pipeline::BatchStreamError::Input(error) => error,
+                speakrs::pipeline::BatchStreamError::Pipeline(error) => error.into(),
+            })?;
+            let batch_elapsed = batch_start.elapsed();
+            tracing::trace!(batch_ms = batch_elapsed.as_millis(), "Batch timing");
+
+            // output results in order
+            let output_start = Instant::now();
+            for (i, result) in results.iter().enumerate() {
+                let file_id = &result.file_id;
+                let audio_secs = result.audio_secs;
+                let per_file = batch_elapsed.as_secs_f64() / (i + 1) as f64;
+                let eta = format_eta((total - i - 1) as f64 * per_file);
+                let elapsed = format_eta(batch_elapsed.as_secs_f64());
+                let now = chrono::Local::now().format("%H:%M:%S");
+                eprintln!(
+                    "  [{}/{}] {file_id}: {audio_secs:.0}s audio (elapsed {elapsed}, ETA {eta}) [{now}]",
+                    i + 1,
+                    total,
+                );
+                print!("{}", result.result.rttm(file_id));
+            }
+
+            eprintln!(
+                "  Total: {:.1}s for {} files",
+                batch_elapsed.as_secs_f64(),
+                total,
+            );
+
+            tracing::trace!(
+                output_us = output_start.elapsed().as_micros(),
+                startup_ms = loop_start.duration_since(command_start).as_millis(),
+                loop_ms = loop_start.elapsed().as_millis(),
+                total_ms = command_start.elapsed().as_millis(),
+                "Command timing",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn default_models_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fixtures/models")
+}
+
+fn run_pyannote_sidecar(device: &str, wav_path: &str) -> Result<String> {
+    let project_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts/pyannote-bench");
+    let output = Command::new("uv")
+        .arg("run")
+        .arg("--project")
+        .arg(&project_path)
+        .arg("python")
+        .arg(project_path.join("diarize.py"))
+        .arg("--device")
+        .arg(device)
+        .arg(wav_path)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("pyannote sidecar exited with {}: {stderr}", output.status);
+    }
+
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn format_eta(seconds: f64) -> String {
+    if seconds < 60.0 {
+        format!("{seconds:.0}s")
+    } else {
+        let mins = (seconds / 60.0).floor() as u64;
+        let secs = (seconds % 60.0).round() as u64;
+        format!("{mins}m {secs:02}s")
+    }
+}

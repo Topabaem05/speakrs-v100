@@ -1,0 +1,19 @@
+[package]
+name = "volta-tc-host"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Runs the Volta tensor-core spike kernels and checks them against a CPU product"
+
+[workspace]
+
+[dependencies]
+# the cudarc build cudakit uses: driver API only, loaded at run time
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-12040",
+] }
+half = "2"

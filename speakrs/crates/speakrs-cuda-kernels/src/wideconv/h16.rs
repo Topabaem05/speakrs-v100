@@ -1,0 +1,2828 @@
+//! Direct FP16 tensor-core implicit GEMM for the same-channel stride-1 trunk
+//! convolutions in TF32 mode, for parts whose FP16 tensor rate is a large multiple of
+//! their FP32 rate and that have no TF32 tensor cores
+//!
+//! Both operands are scaled by 2^10 and rounded to FP16 with `cvt.rn`, which keeps FP16
+//! subnormals, and `mma.sync` accumulates the products in FP32, as m16n8k8 products or,
+//! on the sm120 tier, m16n8k16 products that pair two taps; the epilogue
+//! removes the 2^20 product scale before the residual and bias. The scale is a power of
+//! two, so it changes only which values fall below the FP16 subnormal range. Scaled
+//! operands saturate at the largest finite FP16 value instead of overflowing to
+//! infinity. Over the measured trunk activations the largest scaled operand is about
+//! 38000, below that bound
+//!
+//! Nothing bounds new audio, so every activation conversion also checks its scaled
+//! value: a magnitude above the largest finite FP16 value, or NaN, sets the `range`
+//! word with one `red.global.or` per offending thread, and the host recomputes the
+//! batch without FP16 tiles. In-range launches never write it. The host checks the
+//! weights before it packs them
+//!
+//! A CTA has `channel_warps * rows` warps and covers `rows` output rows by
+//! `8 * n_tiles` columns of one item, for `16 * m_tiles * channel_warps` output
+//! channels. Warp `(m, r)` owns output row `r` of the tile and its `m_tiles` channel
+//! tiles, so each B fragment it loads feeds `m_tiles` products and each A fragment
+//! `n_tiles` products
+//!
+//! Activations stay NCHW FP32 in global memory. Each pipeline stage converts eight input
+//! channels of the input rows behind the tile, with their one-pixel halo, to FP16 and
+//! stores them pixel-major, 16 bytes per pixel, so `ldmatrix` loads four B fragments in
+//! one instruction and eight consecutive pixels of a fragment cover all 32 banks. There
+//! is no `cp.async` on sm_75, so a stage's global loads go to registers before the
+//! previous stage's products and are converted and stored after them, behind one CTA
+//! barrier per stage. Weights come from [`spk_wideconv_pack_h16`] in fragment order and
+//! go straight from global memory into registers two MMA steps ahead
+//!
+//! The epilogue adds the residual before the bias and applies a ReLU that keeps NaN
+//! and negative zero, as the other wideconv kernels do
+//!
+//! The `_half_out` and `_half_in` instances pass a residual block's hidden activation,
+//! which only the block's second convolution reads, in the form that convolution's
+//! staging would make of it: FP16 scaled by 2^10, saturated and range-checked, as
+//! `[batch, channels / 8, h, w, 8]` with 16 bytes per pixel and channel group. A
+//! `_half_out` epilogue converts with the same instructions and sets the range word for
+//! the same values, and a `_half_in` stage copies the 16-byte pixels as they are, so the
+//! pair computes bit for bit what the FP32 pair does while moving half the bytes
+//!
+//! A half epilogue passes each channel tile of a warp's output row through the free
+//! stage memory in that pixel-major form, so it loads a half residual and stores a half
+//! output as whole 16-byte pixels instead of one 2-byte value per lane and fragment slot
+//!
+//! The `_half_in_out`, `_half_all` and `_half_in_res` instances also keep the residual
+//! stream between blocks of one layer in that form: a block's second convolution writes
+//! its output as halves for the next block's first convolution to stage and its second
+//! to add back as the residual. That residual is the FP16-rounded block output scaled
+//! back by 2^-10 instead of the FP32 one, so unlike the hidden activation it changes
+//! the result
+
+// the sm70 variant computes every FP16 entry with its own `wmma` helpers, which leaves
+// the m16n8k8 ones unused
+#![cfg_attr(feature = "tier-sm70", allow(dead_code, unused_imports))]
+
+use cuda_device::shared::cvta_generic_to_shared_u32;
+use cuda_device::vector::U32x4;
+use cuda_device::{DisjointSlice, DynamicSharedArray, kernel, launch_bounds, ptx_asm, thread, warp};
+
+/// FP16 Winograd kernels for the same-channel shapes, which only the RTX 5090 binding
+/// loads
+#[cfg(feature = "tier-sm120")]
+pub mod wino;
+
+/// Rounds `lo` and `hi` scaled by 2^10 to FP16 with round-to-nearest-even, saturating at
+/// the largest finite FP16 value, and packs them with `lo` in the low half
+#[inline(always)]
+fn half2(lo: f32, hi: f32) -> u32 {
+    let packed: u32;
+    // safety: register arithmetic and conversions with no memory access
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b16 l, h; .reg .f32 a, b; mul.rn.f32 a, %1, 0f44800000; mul.rn.f32 b, %2, 0f44800000; max.f32 a, a, 0fC77FE000; max.f32 b, b, 0fC77FE000; min.f32 a, a, 0f477FE000; min.f32 b, b, 0f477FE000; cvt.rn.f16.f32 l, a; cvt.rn.f16.f32 h, b; mov.b32 %0, {l, h}; }",
+            out("=r") packed,
+            in("f") lo,
+            in("f") hi,
+            options(register_only),
+        );
+    }
+    packed
+}
+
+/// As [`half2`] for activations, and also returns 1 when either scaled value is above
+/// the largest finite FP16 value in magnitude or is NaN, so it would saturate
+#[inline(always)]
+fn half2_checked(lo: f32, hi: f32) -> (u32, u32) {
+    let (packed, out_of_range): (u32, u32);
+    // safety: register arithmetic and conversions with no memory access
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b16 l, h; .reg .f32 a, b, m; .reg .pred p; mul.rn.f32 a, %2, 0f44800000; mul.rn.f32 b, %3, 0f44800000; abs.f32 m, a; setp.gtu.f32 p, m, 0f477FE000; abs.f32 m, b; setp.gtu.or.f32 p, m, 0f477FE000, p; selp.u32 %1, 1, 0, p; max.f32 a, a, 0fC77FE000; max.f32 b, b, 0fC77FE000; min.f32 a, a, 0f477FE000; min.f32 b, b, 0f477FE000; cvt.rn.f16.f32 l, a; cvt.rn.f16.f32 h, b; mov.b32 %0, {l, h}; }",
+            out("=r") packed,
+            out("=r") out_of_range,
+            in("f") lo,
+            in("f") hi,
+            options(register_only),
+        );
+    }
+    (packed, out_of_range)
+}
+
+/// As [`half2_checked`] for one value: its FP16 bits in the low half, and 1 when the
+/// scaled value is above the largest finite FP16 value in magnitude or is NaN
+#[inline(always)]
+fn half1_checked(value: f32) -> (u32, u32) {
+    let (bits, out_of_range): (u32, u32);
+    // safety: register arithmetic and conversions with no memory access
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b16 h, z; .reg .f32 a, m; .reg .pred p; mul.rn.f32 a, %2, 0f44800000; abs.f32 m, a; setp.gtu.f32 p, m, 0f477FE000; selp.u32 %1, 1, 0, p; max.f32 a, a, 0fC77FE000; min.f32 a, a, 0f477FE000; cvt.rn.f16.f32 h, a; mov.b16 z, 0; mov.b32 %0, {h, z}; }",
+            out("=r") bits,
+            out("=r") out_of_range,
+            in("f") value,
+            options(register_only),
+        );
+    }
+    (bits, out_of_range)
+}
+
+/// Stores the low half of `bits` at a 2-byte aligned shared address
+#[inline(always)]
+unsafe fn sts_half(address: u32, bits: u32) {
+    // safety: the caller passes an address inside this warp's epilogue tile that no
+    // other lane accesses before the next warp barrier
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u16 v; cvt.u16.u32 v, %1; st.shared.u16 [%0], v; }",
+            in("r") address,
+            in("r") bits,
+            clobber("memory"),
+        );
+    }
+}
+
+/// The FP16 value at a 2-byte aligned shared address, widened to FP32 and still scaled
+/// by 2^10
+#[inline(always)]
+unsafe fn lds_half(address: u32) -> f32 {
+    let value: f32;
+    // safety: the caller passes an address inside this warp's published epilogue tile
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b16 h; ld.shared.b16 h, [%1]; cvt.f32.f16 %0, h; }",
+            out("=f") value,
+            in("r") address,
+            clobber("memory"),
+        );
+    }
+    value
+}
+
+/// Four words at a 16-byte aligned shared address
+#[inline(always)]
+unsafe fn lds4(address: u32) -> [u32; 4] {
+    let (a, b, c, d): (u32, u32, u32, u32);
+    // safety: the caller passes an address inside this warp's published epilogue tile
+    unsafe {
+        ptx_asm!(
+            "ld.shared.v4.b32 {%0, %1, %2, %3}, [%4];",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("r") address,
+            clobber("memory"),
+        );
+    }
+    [a, b, c, d]
+}
+
+/// Four words at a 16-byte aligned address of a global buffer; a plain load, since the
+/// residual may alias the output
+#[inline(always)]
+unsafe fn ld4(pointer: *const f32) -> [u32; 4] {
+    let (a, b, c, d): (u32, u32, u32, u32);
+    // asm rather than a typed load: the opaque load with a memory clobber cannot be moved
+    // past the output stores or turned into a non-coherent load, which a native load
+    // through a `&[f32]` parameter could be
+    // safety: the caller passes a readable, 16-byte aligned run of four words
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %4; ld.global.v4.u32 {%0, %1, %2, %3}, [g]; }",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("l") pointer as u64,
+            clobber("memory"),
+        );
+    }
+    [a, b, c, d]
+}
+
+/// Stores four words at a 16-byte aligned address of a global buffer
+#[inline(always)]
+unsafe fn stg4(pointer: *mut f32, value: [u32; 4]) {
+    // safety: the caller passes a 16-byte aligned run of four words inside the checked
+    // output that only this lane writes
+    unsafe { *(pointer as *mut U32x4) = U32x4::new(value) };
+}
+
+/// Orders this warp's shared memory accesses before and after the call
+#[inline(always)]
+fn sync_warp() {
+    // every caller runs it with all 32 lanes
+    warp::sync_mask(0xffff_ffff);
+}
+
+/// Four words at a 16-byte aligned address of a global buffer no kernel writes during
+/// this launch
+#[inline(always)]
+unsafe fn ldg4(pointer: *const f32) -> [u32; 4] {
+    let (a, b, c, d): (u32, u32, u32, u32);
+    // safety: the caller passes a readable, 16-byte aligned run of four words
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %4; ld.global.nc.v4.u32 {%0, %1, %2, %3}, [g]; }",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("l") pointer as u64,
+        );
+    }
+    [a, b, c, d]
+}
+
+/// Sets the host's out-of-range word; only threads that saw a saturating activation
+/// call this, so in-range launches issue no store
+#[inline(always)]
+unsafe fn flag_out_of_range(pointer: *mut f32) {
+    // safety: the caller passes the checked one-word range buffer; the atomic OR keeps
+    // concurrent writers from different CTAs well defined
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %0; red.global.or.b32 [g], 1; }",
+            in("l") pointer as u64,
+            clobber("memory"),
+        );
+    }
+}
+
+/// Removes the 2^20 scale of a product of two scaled operands; exact for finite sums
+const PRODUCT_UNSCALE: f32 = 1.0 / (1024.0 * 1024.0);
+
+/// Packs folded weights `[cout][cin][3][3]` into FP16 `mma.sync` m16n8k8 A fragments,
+/// scaled by 2^10
+///
+/// Layout `[cin / 8][tap][cout / 16][lane][2]` in 32-bit words of two FP16 values: one
+/// 256-byte block per 16x8 fragment, so a warp loads a fragment with one 8-byte load per
+/// lane. The packed buffer holds `cout * cin * 9 / 2` words in an `f32` slice
+///
+/// Launch one thread per word of `packed`
+#[cfg(not(feature = "tier-sm70"))]
+#[kernel]
+pub fn spk_wideconv_pack_h16(weight: &[f32], cin: u32, cout: u32, mut packed: DisjointSlice<f32>) {
+    let i = thread::index_1d();
+    let index = i.get() as u32;
+    let tiles = cout / 16;
+    let slot = index % 2;
+    let lane = index / 2 % 32;
+    let tile = index / 64 % tiles;
+    let tap = index / (64 * tiles) % 9;
+    let chunk = index / (64 * tiles * 9);
+    // fragment registers: row g, then row g + 8, each with columns 2t and 2t + 1
+    let row = lane / 4 + slot * 8;
+    let col = lane % 4 * 2;
+    let channel_out = tile * 16 + row;
+    let channel_in = chunk * 8 + col;
+    let source = ((channel_out * cin + channel_in) * 9 + tap) as usize;
+    // the high half is the next input channel's weight of the same tap
+    if source + 9 >= weight.len() {
+        return;
+    }
+    if let Some(out) = packed.get_mut(i) {
+        *out = f32::from_bits(half2(weight[source], weight[source + 9]));
+    }
+}
+
+/// The sm70 variant of [`spk_wideconv_pack_h16`]: the row-major 16x16 FP16 tiles that
+/// `wmma.load.a` reads with a leading dimension of 16, scaled by 2^10
+///
+/// Layout `[cin / 16][tap][cout / 16][row][8]` in 32-bit words of two FP16 values: one
+/// 512-byte block per tile, a row being one output channel's 16 input channels. The word
+/// count is the other tiers', `cout * cin * 9 / 2`
+///
+/// Launch one thread per word of `packed`
+#[cfg(feature = "tier-sm70")]
+#[kernel]
+pub fn spk_wideconv_pack_h16(weight: &[f32], cin: u32, cout: u32, mut packed: DisjointSlice<f32>) {
+    let i = thread::index_1d();
+    let index = i.get() as u32;
+    let tiles = cout / 16;
+    let pair = index % 8;
+    let row = index / 8 % 16;
+    let tile = index / 128 % tiles;
+    let tap = index / (128 * tiles) % 9;
+    let chunk = index / (128 * tiles * 9);
+    let channel_out = tile * 16 + row;
+    let channel_in = chunk * 16 + pair * 2;
+    let source = ((channel_out * cin + channel_in) * 9 + tap) as usize;
+    // the high half is the next input channel's weight of the same tap
+    if source + 9 >= weight.len() {
+        return;
+    }
+    if let Some(out) = packed.get_mut(i) {
+        *out = f32::from_bits(half2(weight[source], weight[source + 9]));
+    }
+}
+
+/// One FP32 word from a global buffer no kernel writes during this launch
+#[inline(always)]
+unsafe fn ldg(pointer: *const f32) -> f32 {
+    let value: f32;
+    // safety: the caller passes a readable word of a read-only input
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %1; ld.global.nc.f32 %0, [g]; }",
+            out("=f") value,
+            in("l") pointer as u64,
+        );
+    }
+    value
+}
+
+/// One FP16 A fragment, 8 bytes per lane, through the read-only path
+#[inline(always)]
+unsafe fn fragment(pointer: *const f32) -> [u32; 2] {
+    let (a, b): (u32, u32);
+    // safety: the caller passes an 8-byte aligned pointer into the packed weights, which
+    // no kernel writes during a launch
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %2; ld.global.nc.v2.u32 {%0, %1}, [g]; }",
+            out("=r") a,
+            out("=r") b,
+            in("l") pointer as u64,
+        );
+    }
+    [a, b]
+}
+
+/// Asks L2 for the line holding `pointer`; it never faults and never blocks
+#[inline(always)]
+unsafe fn prefetch(pointer: *const f32) {
+    // safety: the caller passes an address inside a live allocation
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %0; prefetch.global.L2 [g]; }",
+            in("l") pointer as u64,
+        );
+    }
+}
+
+/// Stores four words at a 16-byte aligned shared address
+#[inline(always)]
+unsafe fn sts4(address: u32, value: [u32; 4]) {
+    // safety: the caller passes an address inside this CTA's stage that no other thread
+    // accesses before the next barrier
+    unsafe {
+        ptx_asm!(
+            "st.shared.v4.b32 [%0], {%1, %2, %3, %4};",
+            in("r") address,
+            in("r") value[0],
+            in("r") value[1],
+            in("r") value[2],
+            in("r") value[3],
+            clobber("memory"),
+        );
+    }
+}
+
+/// Four B fragments: lanes `8q..8q + 8` name the eight 16-byte pixel rows of fragment `q`
+#[cfg(not(feature = "tier-sm70"))]
+#[inline(always)]
+unsafe fn ldsm4(address: u32) -> [u32; 4] {
+    let (a, b, c, d): (u32, u32, u32, u32);
+    // safety: a convergent warp-wide load; every caller runs it with all 32 lanes active
+    // and passes a 16-byte aligned row of this CTA's published stage
+    unsafe {
+        ptx_asm!(
+            "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("r") address,
+            clobber("memory"),
+        );
+    }
+    [a, b, c, d]
+}
+
+/// Accumulates one m16n8k8 FP16 product into `c` in FP32
+#[cfg(not(feature = "tier-sm70"))]
+#[inline(always)]
+fn mma(c: [f32; 4], a: [u32; 2], b: u32) -> [f32; 4] {
+    let [mut c0, mut c1, mut c2, mut c3] = c;
+    // safety: a convergent warp-wide register operation; every caller runs it with all
+    // 32 lanes active
+    unsafe {
+        ptx_asm!(
+            "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};",
+            inout("+f") c0,
+            inout("+f") c1,
+            inout("+f") c2,
+            inout("+f") c3,
+            in("r") a[0],
+            in("r") a[1],
+            in("r") b,
+        );
+    }
+    [c0, c1, c2, c3]
+}
+
+/// Whether tap `tap` of a chunk only holds its fragments for the next tap's product
+///
+/// m16n8k16 runs at the m16n8k8 instruction rate, so it does twice the work per tensor
+/// issue: on the sm120 tier an even tap's fragments wait in a held pair and enter the
+/// next tap's product as its upper eight input channels, so a chunk's nine taps take four
+/// k16 products and one k8 product. Each k16 product sums the same FP16 products as the
+/// two k8 products it replaces, in a different FP32 order. Lower tiers keep one k8
+/// product per tap
+#[cfg(feature = "tier-sm120")]
+#[inline(always)]
+fn holds(tap: usize) -> bool {
+    tap % 2 == 0 && tap < 8
+}
+
+/// Adds one product of tap `tap` to `c`, pairing an odd tap with the held fragments of
+/// the tap before it; the tap is a constant in the unrolled tap loops, so the branches
+/// fold away
+#[cfg(feature = "tier-sm120")]
+#[inline(always)]
+fn tap_product(c: [f32; 4], tap: usize, held_a: [u32; 2], a: [u32; 2], held_b: u32, b: u32) -> [f32; 4] {
+    if tap % 2 == 1 {
+        mma_pair(c, held_a, a, held_b, b)
+    } else if holds(tap) {
+        c
+    } else {
+        mma(c, a, b)
+    }
+}
+
+/// Accumulates one m16n8k16 FP16 product into `c` in FP32: `lo` and `b_lo` cover input
+/// channels 0..8 and `hi` and `b_hi` channels 8..16, in the m16n8k8 fragment layouts
+#[cfg(feature = "tier-sm120")]
+#[inline(always)]
+fn mma_pair(c: [f32; 4], lo: [u32; 2], hi: [u32; 2], b_lo: u32, b_hi: u32) -> [f32; 4] {
+    let [mut c0, mut c1, mut c2, mut c3] = c;
+    // safety: a convergent warp-wide register operation; every caller runs it with all
+    // 32 lanes active
+    unsafe {
+        ptx_asm!(
+            "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};",
+            inout("+f") c0,
+            inout("+f") c1,
+            inout("+f") c2,
+            inout("+f") c3,
+            in("r") lo[0],
+            in("r") lo[1],
+            in("r") hi[0],
+            in("r") hi[1],
+            in("r") b_lo,
+            in("r") b_hi,
+        );
+    }
+    [c0, c1, c2, c3]
+}
+
+/// Passes `value` through a side-effecting register move, so staging indices derived
+/// from it are recomputed in every pipeline iteration instead of held in registers
+#[inline(always)]
+fn opaque(value: u32) -> u32 {
+    let out: u32;
+    // safety: a register move with no memory access
+    unsafe {
+        ptx_asm!("mov.u32 %0, %1;", out("=r") out, in("r") value);
+    }
+    out
+}
+
+/// ReLU that passes NaN and negative zero through, like the FP32 kernels
+#[inline(always)]
+fn relu(value: f32) -> f32 {
+    if value < 0.0 { 0.0 } else { value }
+}
+
+/// Bytes of one staged pixel on the sm70 tier: 16 input channels, the K extent of one
+/// `wmma` m16n16k16 product, as two 16-byte groups of eight
+#[cfg(feature = "tier-sm70")]
+const VOLTA_PIXEL_BYTES: u32 = 32;
+
+/// FP32 elements between rows of an sm70 epilogue tile: 64 columns plus four, so the
+/// rows of a `wmma` store fall on different banks
+#[cfg(feature = "tier-sm70")]
+const VOLTA_EPILOGUE_LD: u32 = 68;
+
+/// One warp's sm70 epilogue tile: 16 channels by `VOLTA_EPILOGUE_LD` FP32 columns
+#[cfg(feature = "tier-sm70")]
+const VOLTA_EPILOGUE_BYTES: u32 = 16 * VOLTA_EPILOGUE_LD * 4;
+
+/// The A fragment of a row-major 16x16 FP16 tile of the packed weights, leading
+/// dimension 16; PTX ISA 6.0 spells `wmma` without `.aligned`
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+unsafe fn wmma_load_a(pointer: *const f32) -> [u32; 8] {
+    let (r0, r1, r2, r3, r4, r5, r6, r7): (u32, u32, u32, u32, u32, u32, u32, u32);
+    // safety: a convergent warp-wide load; every caller runs it with all 32 lanes active
+    // and passes a 512-byte tile of the packed weights, which no kernel writes during a
+    // launch
+    unsafe {
+        ptx_asm!(
+            "{ .reg .u64 g; cvta.to.global.u64 g, %8; wmma.load.a.sync.row.m16n16k16.global.f16 {%0, %1, %2, %3, %4, %5, %6, %7}, [g], 16; }",
+            out("=r") r0, out("=r") r1, out("=r") r2, out("=r") r3,
+            out("=r") r4, out("=r") r5, out("=r") r6, out("=r") r7,
+            in("l") pointer as u64,
+        );
+    }
+    [r0, r1, r2, r3, r4, r5, r6, r7]
+}
+
+/// The B fragment of 16 consecutive staged pixels: column `n` is pixel `n`'s 16 input
+/// channels, so the tile is column-major with a leading dimension of 16
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+unsafe fn wmma_load_b(address: u32) -> [u32; 8] {
+    let (r0, r1, r2, r3, r4, r5, r6, r7): (u32, u32, u32, u32, u32, u32, u32, u32);
+    // safety: a convergent warp-wide load; every caller runs it with all 32 lanes active
+    // and passes a 32-byte aligned pixel of this CTA's published stage
+    unsafe {
+        ptx_asm!(
+            "wmma.load.b.sync.col.m16n16k16.shared.f16 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], 16;",
+            out("=r") r0, out("=r") r1, out("=r") r2, out("=r") r3,
+            out("=r") r4, out("=r") r5, out("=r") r6, out("=r") r7,
+            in("r") address,
+            clobber("memory"),
+        );
+    }
+    [r0, r1, r2, r3, r4, r5, r6, r7]
+}
+
+/// Accumulates one m16n16k16 FP16 product into `c` in FP32
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+fn wmma_mma(c: [f32; 8], a: [u32; 8], b: [u32; 8]) -> [f32; 8] {
+    let [mut c0, mut c1, mut c2, mut c3, mut c4, mut c5, mut c6, mut c7] = c;
+    // safety: a convergent warp-wide register operation; every caller runs it with all
+    // 32 lanes active
+    unsafe {
+        ptx_asm!(
+            "wmma.mma.sync.row.col.m16n16k16.f32.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11, %12, %13, %14, %15}, {%16, %17, %18, %19, %20, %21, %22, %23}, {%0, %1, %2, %3, %4, %5, %6, %7};",
+            inout("+f") c0, inout("+f") c1, inout("+f") c2, inout("+f") c3,
+            inout("+f") c4, inout("+f") c5, inout("+f") c6, inout("+f") c7,
+            in("r") a[0], in("r") a[1], in("r") a[2], in("r") a[3],
+            in("r") a[4], in("r") a[5], in("r") a[6], in("r") a[7],
+            in("r") b[0], in("r") b[1], in("r") b[2], in("r") b[3],
+            in("r") b[4], in("r") b[5], in("r") b[6], in("r") b[7],
+        );
+    }
+    [c0, c1, c2, c3, c4, c5, c6, c7]
+}
+
+/// Stores an accumulator as a row-major 16x16 FP32 tile at a shared address, rows
+/// `VOLTA_EPILOGUE_LD` elements apart
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+unsafe fn wmma_store_tile(address: u32, d: [f32; 8]) {
+    // safety: a convergent warp-wide store; every caller runs it with all 32 lanes
+    // active and passes a 32-byte aligned tile inside this warp's epilogue region
+    unsafe {
+        ptx_asm!(
+            "wmma.store.d.sync.row.m16n16k16.shared.f32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8}, 68;",
+            in("r") address,
+            in("f") d[0], in("f") d[1], in("f") d[2], in("f") d[3],
+            in("f") d[4], in("f") d[5], in("f") d[6], in("f") d[7],
+            clobber("memory"),
+        );
+    }
+}
+
+/// One FP32 word at a 4-byte aligned shared address
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+unsafe fn lds_f32(address: u32) -> f32 {
+    let value: f32;
+    // safety: the caller passes an address inside this warp's published epilogue tile
+    unsafe {
+        ptx_asm!(
+            "ld.shared.f32 %0, [%1];",
+            out("=f") value,
+            in("r") address,
+            clobber("memory"),
+        );
+    }
+    value
+}
+
+/// `index`, behind a statement-level `.pragma "nounroll"` that keeps ptxas from unrolling
+/// the loop whose body this starts. The pragma counts only before every other statement
+/// of the loop header, so the loop index passes through it and the whole body depends on
+/// the copy; braces would scope the pragma to themselves
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+fn nounroll(index: u32) -> u32 {
+    let out: u32;
+    // safety: a compiler directive and a register move with no memory access
+    unsafe {
+        ptx_asm!(".pragma \"nounroll\"; mov.u32 %0, %1;", out("=r") out, in("r") index);
+    }
+    out
+}
+
+/// The two FP16 values of a half-tensor word widened to FP32, still scaled by 2^10: the
+/// lower channel's from the low half
+#[cfg(feature = "tier-sm70")]
+#[inline(always)]
+fn unpack_half2(word: u32) -> (f32, f32) {
+    let (lo, hi): (f32, f32);
+    // safety: register conversions with no memory access
+    unsafe {
+        ptx_asm!(
+            "{ .reg .b16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h; }",
+            out("=f") lo,
+            out("=f") hi,
+            in("r") word,
+            options(register_only),
+        );
+    }
+    (lo, hi)
+}
+
+/// One A fragment of this warp: MMA step `$step`, channel tile `$tile` of the warp
+macro_rules! fragment_at {
+    ($wp:expr, $step:expr, $tile:expr) => {
+        // safety: `step < STEPS` and the warp's tiles index a fragment of the packed weights
+        unsafe { fragment($wp.add((($step * TILES + $tile) * 64) as usize)) }
+    };
+}
+
+/// Expands to one 3x3, stride-1, padding-1 FP16 convolution over `channels` channels on
+/// `h x w` inputs
+macro_rules! h16_conv3x3 {
+    (
+        $(#[$doc:meta])*
+        $name:ident,
+        channels = $channels:expr,
+        h = $h:expr,
+        w = $w:expr,
+        m_tiles = $mt:expr,
+        channel_warps = $wm:expr,
+        rows = $rows:expr,
+        n_tiles = $nt:expr,
+        threads = $threads:literal,
+        min_blocks = $min_blocks:literal,
+        half_input = $half_input:literal,
+        half_residual = $half_residual:literal,
+        half_output = $half_output:literal $(,)?
+    ) => {
+        // sm_70 has neither `ldmatrix` nor the m16n8k8 shape, so the sm70 variant computes
+        // the same tile with `wmma` m16n16k16 products over chunks of 16 input channels.
+        // A chunk's pixels are staged at 32 bytes, which is the column-major B operand
+        // `wmma.load.b` reads, and each half of eight channels is loaded and stored around
+        // half of the taps so the staged FP32 values stay at eight registers per slot. The
+        // operand rounding, range checks and epilogue order are those of the other tiers;
+        // each channel tile of the accumulator passes through shared memory to the
+        // epilogue, which handles a pixel's eight-channel groups as whole half pixels
+        #[cfg(feature = "tier-sm70")]
+        $(#[$doc])*
+        #[kernel]
+        #[launch_bounds($threads, $min_blocks)]
+        pub fn $name(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            residual: &[f32],
+            add_residual: u32,
+            batch: u32,
+            mut y: DisjointSlice<f32>,
+            mut range: DisjointSlice<f32>,
+        ) {
+            const HALF_IN: bool = $half_input;
+            const HALF_RES: bool = $half_residual;
+            const HALF_OUT: bool = $half_output;
+            const C: u32 = $channels;
+            const H: u32 = $h;
+            const W: u32 = $w;
+            const HW: u32 = H * W;
+            const MT: usize = $mt;
+            const WM: u32 = $wm;
+            const ROWS: u32 = $rows;
+            const NT: usize = $nt;
+            const THREADS: u32 = $threads;
+            const COLS: u32 = NT as u32 * 8;
+            // n16 tiles of a warp's output row
+            const NJ: usize = NT / 2;
+            const CTA_CHANNELS: u32 = WM * MT as u32 * 16;
+            const BLOCKS: u32 = C / CTA_CHANNELS;
+            const TILES: u32 = C / 16;
+            const IN_ROWS: u32 = ROWS + 2;
+            const IN_COLS: u32 = COLS + 2;
+            const PIXELS: u32 = IN_ROWS * IN_COLS;
+            const SLOTS: usize = PIXELS.div_ceil(THREADS) as usize;
+            const STAGE_BYTES: u32 = PIXELS * VOLTA_PIXEL_BYTES;
+            const GROUPS: u32 = C / 8;
+            const CHUNKS: u32 = C / 16;
+            // removes the 2^10 operand scale of a half residual; exact, as a power of two
+            const RESIDUAL_UNSCALE: f32 = 1.0 / 1024.0;
+            const _: () = assert!(
+                THREADS == 32 * WM * ROWS
+                    && C % CTA_CHANNELS == 0
+                    && NT == 8
+                    && C % 16 == 0
+                    && COLS == 64
+            );
+
+            let item = thread::blockIdx_z() / BLOCKS;
+            let block = thread::blockIdx_z() % BLOCKS;
+            let oy0 = thread::blockIdx_y() * ROWS;
+            let ox0 = thread::blockIdx_x() * COLS;
+            // the host sizes every buffer; a mismatch must not touch other memory
+            // a half tensor holds two values per word
+            let x_words = if HALF_IN { batch * C * HW / 2 } else { batch * C * HW };
+            let y_words = if HALF_OUT { batch * C * HW / 2 } else { batch * C * HW };
+            let residual_words = if HALF_RES { batch * C * HW / 2 } else { batch * C * HW };
+            if x_words as usize > x.len()
+                || y_words as usize > y.len()
+                || (add_residual != 0 && residual_words as usize > residual.len())
+                || (C * C * 9 / 2) as usize > weight.len()
+                || C as usize > bias.len()
+                || range.len() == 0
+                || item >= batch
+                || oy0 >= H
+                || ox0 >= W
+            {
+                return;
+            }
+            let base = item * C * HW;
+
+            let tid = thread::threadIdx_x();
+            let lane = tid % 32;
+            let warp = tid / 32;
+            let warp_m = warp % WM;
+            let warp_r = warp / WM;
+            // safety: the dynamic shared base of this CTA; only its address is taken
+            let smem = unsafe { cvta_generic_to_shared_u32(DynamicSharedArray::<f32, 32>::get() as *const u8) };
+            let x_ptr = x.as_ptr();
+            let w_ptr = weight.as_ptr();
+            let tile0 = block * (CTA_CHANNELS / 16) + warp_m * MT as u32;
+
+            let mut acc = [[[0.0f32; 8]; NJ]; MT];
+            let mut staged = [[0.0f32; 8]; SLOTS];
+            let mut staged_half = [[0u32; 4]; SLOTS];
+            // nonzero once this thread converts an activation that saturates
+            let mut out_of_range = 0u32;
+
+            // iteration `i_stage` stages chunk `i_stage` while it computes the chunk before
+            // it: half `h` loads the chunk's channel group `2 * i_stage + h`, computes the
+            // previous chunk's taps of that half, then converts and stores the group
+            let mut i_stage = 0;
+            while i_stage <= CHUNKS {
+                let mut half = 0;
+                #[unroll]
+                while half < 2 {
+                    if i_stage < CHUNKS {
+                        let group = 2 * i_stage + half as u32;
+                        let tid = opaque(tid);
+                        let mut k = 0;
+                        #[unroll]
+                        while k < SLOTS {
+                            let e = tid + k as u32 * THREADS;
+                            let r = e / IN_COLS;
+                            let column = e - r * IN_COLS;
+                            // padded coordinates, one above and left of the input's
+                            let iy = oy0 + r;
+                            let ix = ox0 + column;
+                            let inside = e < PIXELS && iy >= 1 && iy <= H && ix >= 1 && ix <= W;
+                            if HALF_IN {
+                                // channel group `group` of the item is a half tensor plane,
+                                // four words per pixel; padding loads the item's first
+                                // pixel and discards it
+                                let plane = (item * GROUPS + group) * HW;
+                                let offset = if inside { (plane + (iy - 1) * W + ix - 1) * 4 } else { item * GROUPS * HW * 4 };
+                                // safety: inside the checked half input, 16-byte aligned
+                                let words = unsafe { ldg4(x_ptr.add(offset as usize)) };
+                                staged_half[k] = if inside { words } else { [0; 4] };
+                            } else {
+                                // padding loads the item's first word and discards it, so
+                                // every lane issues the same loads
+                                let channels = base + group * 8 * HW;
+                                let offset = if inside { channels + (iy - 1) * W + ix - 1 } else { base };
+                                let mut ci = 0;
+                                #[unroll]
+                                while ci < 8 {
+                                    // safety: inside the checked input
+                                    let value = unsafe { ldg(x_ptr.add((offset + ci as u32 * HW) as usize)) };
+                                    staged[k][ci] = if inside { value } else { 0.0 };
+                                    ci += 1;
+                                }
+                            }
+                            k += 1;
+                        }
+                    }
+                    if i_stage > 0 {
+                        let chunk = i_stage - 1;
+                        let stage = smem + chunk % 2 * STAGE_BYTES;
+                        // taps 0 to 4 run with the first half, 5 to 8 with the second. The
+                        // tap loop stays rolled: sm_70 issues each `wmma` product as 16
+                        // HMMA instructions, so one tap's products already fill an SM
+                        // partition's instruction cache, and unrolled taps stall on fetch
+                        // and spill
+                        let mut next = if half == 0 { 0 } else { 5 };
+                        let end = if half == 0 { 5 } else { 9 };
+                        while next < end {
+                            let tap = nounroll(next);
+                            let ky = tap / 3;
+                            let row = (warp_r + ky) * IN_COLS + tap - 3 * ky;
+                            let mut b = [[0u32; 8]; NJ];
+                            let mut j = 0;
+                            #[unroll]
+                            while j < NJ {
+                                // safety: 16 pixels of this buffer's published stage
+                                b[j] = unsafe { wmma_load_b(stage + (row + j as u32 * 16) * VOLTA_PIXEL_BYTES) };
+                                j += 1;
+                            }
+                            let tiles = (chunk * 9 + tap) * TILES + tile0;
+                            let mut i = 0;
+                            #[unroll]
+                            while i < MT {
+                                // safety: a 512-byte tile inside the checked packed weights
+                                let a = unsafe { wmma_load_a(w_ptr.add(((tiles + i as u32) * 128) as usize)) };
+                                let mut j = 0;
+                                #[unroll]
+                                while j < NJ {
+                                    acc[i][j] = wmma_mma(acc[i][j], a, b[j]);
+                                    j += 1;
+                                }
+                                i += 1;
+                            }
+                            next = tap + 1;
+                        }
+                    }
+                    if i_stage < CHUNKS {
+                        let stage = smem + i_stage % 2 * STAGE_BYTES + half as u32 * 16;
+                        let tid = opaque(tid);
+                        let mut k = 0;
+                        #[unroll]
+                        while k < SLOTS {
+                            let e = tid + k as u32 * THREADS;
+                            if e < PIXELS {
+                                // the producer of a half input converted and range-checked it
+                                let words = if HALF_IN {
+                                    staged_half[k]
+                                } else {
+                                    let s = staged[k];
+                                    let (w0, r0) = half2_checked(s[0], s[1]);
+                                    let (w1, r1) = half2_checked(s[2], s[3]);
+                                    let (w2, r2) = half2_checked(s[4], s[5]);
+                                    let (w3, r3) = half2_checked(s[6], s[7]);
+                                    out_of_range |= r0 | r1 | r2 | r3;
+                                    [w0, w1, w2, w3]
+                                };
+                                // safety: this half of pixel `e` of the stage that no warp
+                                // reads until the barrier below
+                                unsafe { sts4(stage + e * VOLTA_PIXEL_BYTES, words) };
+                            }
+                            k += 1;
+                        }
+                    }
+                    half += 1;
+                }
+                // publishes the stored stage and closes every read of the stage the next
+                // iteration overwrites
+                thread::sync_threads();
+                i_stage += 1;
+            }
+            if out_of_range != 0 {
+                // safety: `range` holds at least one word, checked above
+                unsafe { flag_out_of_range(range.as_mut_ptr()) };
+            }
+
+            let oy = oy0 + warp_r;
+            if oy >= H {
+                return;
+            }
+            // this warp's epilogue tile; the stages are free once the last barrier above
+            // closed their reads
+            let tile_smem = smem + warp * VOLTA_EPILOGUE_BYTES;
+            let residual_ptr = residual.as_ptr();
+            let bias_ptr = bias.as_ptr();
+            let y_ptr = y.as_mut_ptr();
+            // nonzero once this thread converts an output that saturates
+            let mut output_out_of_range = 0u32;
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                let mut j = 0;
+                #[unroll]
+                while j < NJ {
+                    // safety: this warp's tile, 64 bytes per 16 columns
+                    unsafe { wmma_store_tile(tile_smem + j as u32 * 64, acc[i][j]) };
+                    j += 1;
+                }
+                sync_warp();
+                // lane `l` takes pixels `l` and `l + 32` of both eight-channel groups; the
+                // residual may alias the output, and each value is read by the lane that
+                // then writes it
+                let mut part = 0;
+                #[unroll]
+                while part < 4 {
+                    let column = lane + part as u32 % 2 * 32;
+                    let pair = part as u32 / 2;
+                    let ox = ox0 + column;
+                    if ox < W {
+                        let channel0 = (tile0 + i as u32) * 16 + pair * 8;
+                        let plane = (item * GROUPS + channel0 / 8) * HW;
+                        let mut v = [0.0f32; 8];
+                        let mut c = 0;
+                        #[unroll]
+                        while c < 8 {
+                            let address = tile_smem + ((pair * 8 + c as u32) * VOLTA_EPILOGUE_LD + column) * 4;
+                            // safety: inside this warp's published tile
+                            v[c] = (unsafe { lds_f32(address) }) * PRODUCT_UNSCALE;
+                            c += 1;
+                        }
+                        // the sum goes in before the bias, as cuDNN's fused call adds them
+                        if add_residual != 0 {
+                            if HALF_RES {
+                                // safety: inside the checked half residual, 16-byte aligned
+                                let words = unsafe { ld4(residual_ptr.add(((plane + oy * W + ox) * 4) as usize)) };
+                                let mut c = 0;
+                                #[unroll]
+                                while c < 4 {
+                                    let (lo, hi) = unpack_half2(words[c]);
+                                    v[2 * c] += lo * RESIDUAL_UNSCALE;
+                                    v[2 * c + 1] += hi * RESIDUAL_UNSCALE;
+                                    c += 1;
+                                }
+                            } else {
+                                let mut c = 0;
+                                #[unroll]
+                                while c < 8 {
+                                    let index = base + (channel0 + c as u32) * HW + oy * W + ox;
+                                    // safety: inside the checked residual
+                                    v[c] += unsafe { *residual_ptr.add(index as usize) };
+                                    c += 1;
+                                }
+                            }
+                        }
+                        let mut c = 0;
+                        #[unroll]
+                        while c < 8 {
+                            // safety: `channel0 + c < C`, inside the checked bias
+                            v[c] = relu(v[c] + unsafe { *bias_ptr.add((channel0 + c as u32) as usize) });
+                            c += 1;
+                        }
+                        if HALF_OUT {
+                            let (w0, r0) = half2_checked(v[0], v[1]);
+                            let (w1, r1) = half2_checked(v[2], v[3]);
+                            let (w2, r2) = half2_checked(v[4], v[5]);
+                            let (w3, r3) = half2_checked(v[6], v[7]);
+                            output_out_of_range |= r0 | r1 | r2 | r3;
+                            // safety: inside the checked half output, 16-byte aligned; this
+                            // lane is the pixel group's only writer
+                            unsafe { stg4(y_ptr.add(((plane + oy * W + ox) * 4) as usize), [w0, w1, w2, w3]) };
+                        } else {
+                            let mut c = 0;
+                            #[unroll]
+                            while c < 8 {
+                                let index = base + (channel0 + c as u32) * HW + oy * W + ox;
+                                // safety: inside the checked output; this lane is its only writer
+                                unsafe { *y.get_unchecked_mut(index as usize) = v[c] };
+                                c += 1;
+                            }
+                        }
+                    }
+                    part += 1;
+                }
+                // closes this tile's reads before the next tile's stores
+                sync_warp();
+                i += 1;
+            }
+            if HALF_OUT && output_out_of_range != 0 {
+                // safety: `range` holds at least one word, checked above
+                unsafe { flag_out_of_range(range.as_mut_ptr()) };
+            }
+        }
+
+        #[cfg(not(feature = "tier-sm70"))]
+        $(#[$doc])*
+        #[kernel]
+        #[launch_bounds($threads, $min_blocks)]
+        pub fn $name(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            residual: &[f32],
+            add_residual: u32,
+            batch: u32,
+            mut y: DisjointSlice<f32>,
+            mut range: DisjointSlice<f32>,
+        ) {
+            const HALF_IN: bool = $half_input;
+            const HALF_RES: bool = $half_residual;
+            const HALF_OUT: bool = $half_output;
+            const C: u32 = $channels;
+            const H: u32 = $h;
+            const W: u32 = $w;
+            const HW: u32 = H * W;
+            const MT: usize = $mt;
+            const WM: u32 = $wm;
+            const ROWS: u32 = $rows;
+            const NT: usize = $nt;
+            const THREADS: u32 = $threads;
+            const COLS: u32 = NT as u32 * 8;
+            const CTA_CHANNELS: u32 = WM * MT as u32 * 16;
+            const BLOCKS: u32 = C / CTA_CHANNELS;
+            const TILES: u32 = C / 16;
+            // staged input rows and columns behind the tile, with the one-pixel halo
+            const IN_ROWS: u32 = ROWS + 2;
+            const IN_COLS: u32 = COLS + 2;
+            const PIXELS: u32 = IN_ROWS * IN_COLS;
+            const SLOTS: usize = PIXELS.div_ceil(THREADS) as usize;
+            const STAGE_BYTES: u32 = PIXELS * 16;
+            const CHUNKS: u32 = C / 8;
+            const STEPS: u32 = CHUNKS * 9;
+            // residual lines of a warp's output row: 64 columns of each of its channels
+            // span at most three 128-byte lines
+            const RESIDUAL_PREFETCHES: usize = MT * 16 * 3 / 32;
+            // a half residual row has 16 bytes per pixel for each of the warp's channel
+            // groups, so 64 columns of a group span at most nine 128-byte lines
+            const HALF_RESIDUAL_LINES: u32 = MT as u32 * 2 * 9;
+            const HALF_RESIDUAL_PREFETCHES: usize = HALF_RESIDUAL_LINES.div_ceil(32) as usize;
+            // removes the 2^10 operand scale of a half residual; exact, as a power of two
+            const RESIDUAL_UNSCALE: f32 = 1.0 / 1024.0;
+            // a half epilogue passes one channel tile of the warp's output row at a time
+            // through shared memory, pixel-major like the half tensors: two channel groups
+            // of 64 pixels, 16 bytes each, so global accesses are whole 16-byte pixels
+            const GROUP_BYTES: u32 = COLS * 16;
+            const TILE_BYTES: u32 = 2 * GROUP_BYTES;
+            const _: () = assert!(
+                THREADS == 32 * WM * ROWS
+                    && C % CTA_CHANNELS == 0
+                    && NT % 4 == 0
+                    && C % 16 == 0
+                    && COLS == 64
+                    && MT % 2 == 0
+                    && (!(HALF_OUT || HALF_RES) || WM * ROWS * TILE_BYTES <= 2 * STAGE_BYTES)
+            );
+
+            let item = thread::blockIdx_z() / BLOCKS;
+            let block = thread::blockIdx_z() % BLOCKS;
+            let oy0 = thread::blockIdx_y() * ROWS;
+            let ox0 = thread::blockIdx_x() * COLS;
+            // the host sizes every buffer; a mismatch must not touch other memory
+            // a half tensor holds two values per word
+            let x_words = if HALF_IN { batch * C * HW / 2 } else { batch * C * HW };
+            let y_words = if HALF_OUT { batch * C * HW / 2 } else { batch * C * HW };
+            let residual_words = if HALF_RES { batch * C * HW / 2 } else { batch * C * HW };
+            if x_words as usize > x.len()
+                || y_words as usize > y.len()
+                || (add_residual != 0 && residual_words as usize > residual.len())
+                || (C * C * 9 / 2) as usize > weight.len()
+                || C as usize > bias.len()
+                || range.len() == 0
+                || item >= batch
+                || oy0 >= H
+                || ox0 >= W
+            {
+                return;
+            }
+            let base = item * C * HW;
+
+            let tid = thread::threadIdx_x();
+            let lane = tid % 32;
+            let warp = tid / 32;
+            let warp_m = warp % WM;
+            let warp_r = warp / WM;
+            let g = lane / 4;
+            let t = lane % 4;
+            // safety: the dynamic shared base of this CTA; only its address is taken
+            let smem = unsafe { cvta_generic_to_shared_u32(DynamicSharedArray::<f32, 16>::get() as *const u8) };
+            let x_ptr = x.as_ptr();
+            // this lane's `ldmatrix` row for tap (0, 0) and fragments 0..4: staged row
+            // `warp_r`, column `lane`, which is pixel `lane % 8` of fragment `lane / 8`
+            let lane_row = (warp_r * IN_COLS + lane) * 16;
+            let tile0 = block * (CTA_CHANNELS / 16) + warp_m * MT as u32;
+            // safety: offsets below stay inside the checked packed weights
+            let wp = unsafe { weight.as_ptr().add(((tile0 * 32 + lane) * 2) as usize) };
+
+            let mut ring = [[[0u32; 2]; MT]; 3];
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                ring[0][i] = fragment_at!(wp, 0, i as u32);
+                ring[1][i] = fragment_at!(wp, 1, i as u32);
+                i += 1;
+            }
+            let mut acc = [[[0.0f32; 4]; NT]; MT];
+            let mut staged = [[0.0f32; 8]; SLOTS];
+            let mut staged_half = [[0u32; 4]; SLOTS];
+            // nonzero once this thread converts an activation that saturates
+            let mut out_of_range = 0u32;
+
+            // iteration `i_stage` loads chunk `i_stage`, computes the chunk before it,
+            // then stores the loaded chunk, so one copy of the staging code serves the
+            // prologue and the loop
+            let mut i_stage = 0;
+            while i_stage <= CHUNKS {
+                if i_stage < CHUNKS {
+                    let channels = base + i_stage * 8 * HW;
+                    let tid = opaque(tid);
+                    let mut k = 0;
+                    #[unroll]
+                    while k < SLOTS {
+                        let e = tid + k as u32 * THREADS;
+                        let r = e / IN_COLS;
+                        let column = e - r * IN_COLS;
+                        // padded coordinates, one above and left of the input's
+                        let iy = oy0 + r;
+                        let ix = ox0 + column;
+                        let inside = e < PIXELS && iy >= 1 && iy <= H && ix >= 1 && ix <= W;
+                        if HALF_IN {
+                            // the staged pixel is already in global memory: channel group
+                            // `i_stage` of the item, four words per pixel; padding loads the
+                            // item's first pixel and discards it
+                            let group = (item * CHUNKS + i_stage) * HW;
+                            let offset = if inside { (group + (iy - 1) * W + ix - 1) * 4 } else { item * CHUNKS * HW * 4 };
+                            // safety: inside the checked half input, 16-byte aligned
+                            let words = unsafe { ldg4(x_ptr.add(offset as usize)) };
+                            staged_half[k] = if inside { words } else { [0; 4] };
+                        } else {
+                            // padding loads the item's first word and discards it, so every
+                            // lane issues the same loads
+                            let offset = if inside { channels + (iy - 1) * W + ix - 1 } else { base };
+                            let mut ci = 0;
+                            #[unroll]
+                            while ci < 8 {
+                                // safety: inside the checked input
+                                let value = unsafe { ldg(x_ptr.add((offset + ci as u32 * HW) as usize)) };
+                                staged[k][ci] = if inside { value } else { 0.0 };
+                                ci += 1;
+                            }
+                        }
+                        k += 1;
+                    }
+                }
+                if i_stage > 0 {
+                    let chunk = i_stage - 1;
+                    if add_residual != 0 && chunk + 2 == CHUNKS && oy0 + warp_r < H {
+                        // pulls this warp's residual row into L2 while the last chunks
+                        // compute, so the epilogue does not wait on DRAM: lane `l` of
+                        // pass `k` takes channel `(32k + l) / 3` at its first, middle or
+                        // last column
+                        let residual_ptr = residual.as_ptr();
+                        let row = base + (oy0 + warp_r) * W;
+                        if HALF_RES {
+                            // lane `l` of pass `k` takes line `(32k + l) % 9` of channel
+                            // group `(32k + l) / 9`, eight pixels per line
+                            let mut k = 0;
+                            #[unroll]
+                            while k < HALF_RESIDUAL_PREFETCHES {
+                                let line = lane + 32 * k as u32;
+                                if line < HALF_RESIDUAL_LINES {
+                                    let group = item * CHUNKS + tile0 * 2 + line / 9;
+                                    let column = ox0 + line % 9 * 8;
+                                    let column = if column >= W { W - 1 } else { column };
+                                    let word = (group * HW + (oy0 + warp_r) * W + column) * 4;
+                                    // safety: inside the checked half residual
+                                    unsafe { prefetch(residual_ptr.add(word as usize)) };
+                                }
+                                k += 1;
+                            }
+                        } else {
+                            let mut k = 0;
+                            #[unroll]
+                            while k < RESIDUAL_PREFETCHES {
+                                let line = lane + 32 * k as u32;
+                                let channel = tile0 * 16 + line / 3;
+                                let column = ox0 + (line % 3) * (COLS - 1) / 2;
+                                let column = if column >= W { W - 1 } else { column };
+                                // safety: inside the checked residual
+                                unsafe { prefetch(residual_ptr.add((row + channel * HW + column) as usize)) };
+                                k += 1;
+                            }
+                        }
+                    }
+                    let stage = smem + chunk % 2 * STAGE_BYTES + lane_row;
+                    #[cfg(feature = "tier-sm120")]
+                    let mut held = ([[0u32; 2]; MT], [0u32; NT]);
+                    let mut tap = 0;
+                    #[unroll]
+                    while tap < 9 {
+                        let step = chunk * 9 + tap as u32 + 2;
+                        let step = if step >= STEPS { step - STEPS } else { step };
+                        let mut i = 0;
+                        #[unroll]
+                        while i < MT {
+                            ring[(tap + 2) % 3][i] = fragment_at!(wp, step, i as u32);
+                            i += 1;
+                        }
+                        let (ky, kx) = (tap as u32 / 3, tap as u32 % 3);
+                        let tap_offset = (ky * IN_COLS + kx) * 16;
+                        let mut b = [0u32; NT];
+                        let mut q = 0;
+                        #[unroll]
+                        while q < NT / 4 {
+                            // safety: the row lies inside this buffer's published stage
+                            let quad = unsafe { ldsm4(stage + tap_offset + q as u32 * 32 * 16) };
+                            b[4 * q] = quad[0];
+                            b[4 * q + 1] = quad[1];
+                            b[4 * q + 2] = quad[2];
+                            b[4 * q + 3] = quad[3];
+                            q += 1;
+                        }
+                        #[cfg(not(feature = "tier-sm120"))]
+                        {
+                            let mut j = 0;
+                            #[unroll]
+                            while j < NT {
+                                let mut i = 0;
+                                #[unroll]
+                                while i < MT {
+                                    acc[i][j] = mma(acc[i][j], ring[tap % 3][i], b[j]);
+                                    i += 1;
+                                }
+                                j += 1;
+                            }
+                        }
+                        #[cfg(feature = "tier-sm120")]
+                        {
+                            let mut j = 0;
+                            #[unroll]
+                            while j < NT {
+                                let mut i = 0;
+                                #[unroll]
+                                while i < MT {
+                                    let (a, c) = (ring[tap % 3][i], acc[i][j]);
+                                    acc[i][j] = tap_product(c, tap, held.0[i], a, held.1[j], b[j]);
+                                    i += 1;
+                                }
+                                j += 1;
+                            }
+                            if holds(tap) {
+                                held = (ring[tap % 3], b);
+                            }
+                        }
+                        tap += 1;
+                    }
+                }
+                if i_stage < CHUNKS {
+                    let stage = smem + i_stage % 2 * STAGE_BYTES;
+                    let tid = opaque(tid);
+                    let mut k = 0;
+                    #[unroll]
+                    while k < SLOTS {
+                        let e = tid + k as u32 * THREADS;
+                        if e < PIXELS {
+                            // the producer of a half input converted and range-checked it
+                            let words = if HALF_IN {
+                                staged_half[k]
+                            } else {
+                                let s = staged[k];
+                                let (w0, r0) = half2_checked(s[0], s[1]);
+                                let (w1, r1) = half2_checked(s[2], s[3]);
+                                let (w2, r2) = half2_checked(s[4], s[5]);
+                                let (w3, r3) = half2_checked(s[6], s[7]);
+                                out_of_range |= r0 | r1 | r2 | r3;
+                                [w0, w1, w2, w3]
+                            };
+                            // safety: pixel `e` of the stage that no warp reads until
+                            // the barrier below
+                            unsafe { sts4(stage + e * 16, words) };
+                        }
+                        k += 1;
+                    }
+                }
+                // publishes the stored stage and closes every read of the stage the next
+                // iteration overwrites
+                thread::sync_threads();
+                i_stage += 1;
+            }
+            if out_of_range != 0 {
+                // safety: `range` holds at least one word, checked above
+                unsafe { flag_out_of_range(range.as_mut_ptr()) };
+            }
+
+            let oy = oy0 + warp_r;
+            if oy >= H {
+                return;
+            }
+            let row = base + oy * W;
+            // nonzero once this thread converts an output that saturates
+            let mut output_out_of_range = 0u32;
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                let mut slot = 0;
+                #[unroll]
+                while slot < 4 {
+                    let mut j = 0;
+                    #[unroll]
+                    while j < NT {
+                        acc[i][j][slot] *= PRODUCT_UNSCALE;
+                        j += 1;
+                    }
+                    slot += 1;
+                }
+                i += 1;
+            }
+            // this warp's epilogue tile; the stages are free once the last barrier above
+            // closed their reads
+            let tile_smem = smem + warp * TILE_BYTES;
+            // this lane's offset in a tile for slot 0 of fragment 0: channel `g` of the
+            // first group at pixel `2t`
+            let lane_half = 2 * t * 16 + g * 2;
+            // the residual may alias the output, so reading it all before any store lets
+            // the loads overlap; the sum goes in before the bias, as cuDNN's fused call
+            // adds them
+            if add_residual != 0 {
+                let residual_ptr = residual.as_ptr();
+                let mut i = 0;
+                #[unroll]
+                while i < MT {
+                    if HALF_RES {
+                        // lane `l` copies pixels `l` and `l + 32` of both channel groups
+                        let mut part = 0;
+                        #[unroll]
+                        while part < 4 {
+                            let column = lane + part as u32 % 2 * 32;
+                            let ox = ox0 + column;
+                            if ox < W {
+                                let group = item * CHUNKS + (tile0 + i as u32) * 2 + part as u32 / 2;
+                                // safety: inside the checked half residual, 16-byte aligned
+                                let words = unsafe { ld4(residual_ptr.add(((group * HW + oy * W + ox) * 4) as usize)) };
+                                // safety: inside this warp's tile
+                                unsafe { sts4(tile_smem + part as u32 / 2 * GROUP_BYTES + column * 16, words) };
+                            }
+                            part += 1;
+                        }
+                        sync_warp();
+                    }
+                    let mut slot = 0;
+                    #[unroll]
+                    while slot < 4 {
+                        let channel = (tile0 + i as u32) * 16 + g + slot as u32 / 2 * 8;
+                        let channel_row = row + channel * HW;
+                        let mut j = 0;
+                        #[unroll]
+                        while j < NT {
+                            let ox = ox0 + j as u32 * 8 + 2 * t + slot as u32 % 2;
+                            if ox < W {
+                                acc[i][j][slot] += if HALF_RES {
+                                    let address = tile_smem
+                                        + slot as u32 / 2 * GROUP_BYTES
+                                        + (j as u32 * 8 + slot as u32 % 2) * 16
+                                        + lane_half;
+                                    // safety: inside this warp's published tile
+                                    (unsafe { lds_half(address) }) * RESIDUAL_UNSCALE
+                                } else {
+                                    // safety: inside the checked residual
+                                    unsafe { *residual_ptr.add((channel_row + ox) as usize) }
+                                };
+                            }
+                            j += 1;
+                        }
+                        slot += 1;
+                    }
+                    if HALF_RES {
+                        // closes this tile's reads before the next tile's copy
+                        sync_warp();
+                    }
+                    i += 1;
+                }
+            }
+
+            let bias_ptr = bias.as_ptr();
+            let y_ptr = y.as_mut_ptr();
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                let mut slot = 0;
+                #[unroll]
+                while slot < 4 {
+                    let channel = (tile0 + i as u32) * 16 + g + slot as u32 / 2 * 8;
+                    // safety: `channel < C`, inside the checked bias
+                    let b = unsafe { *bias_ptr.add(channel as usize) };
+                    let channel_row = row + channel * HW;
+                    let mut j = 0;
+                    #[unroll]
+                    while j < NT {
+                        let ox = ox0 + j as u32 * 8 + 2 * t + slot as u32 % 2;
+                        if ox < W {
+                            let value = relu(acc[i][j][slot] + b);
+                            if HALF_OUT {
+                                let (bits, out_of_range) = half1_checked(value);
+                                output_out_of_range |= out_of_range;
+                                let address = tile_smem
+                                    + slot as u32 / 2 * GROUP_BYTES
+                                    + (j as u32 * 8 + slot as u32 % 2) * 16
+                                    + lane_half;
+                                // safety: inside this warp's tile; this lane is its only writer
+                                unsafe { sts_half(address, bits) };
+                            } else {
+                                // safety: inside the checked output; this lane is its only writer
+                                unsafe { *y.get_unchecked_mut((channel_row + ox) as usize) = value };
+                            }
+                        }
+                        j += 1;
+                    }
+                    slot += 1;
+                }
+                if HALF_OUT {
+                    sync_warp();
+                    // lane `l` writes pixels `l` and `l + 32` of both channel groups
+                    let mut part = 0;
+                    #[unroll]
+                    while part < 4 {
+                        let column = lane + part as u32 % 2 * 32;
+                        let ox = ox0 + column;
+                        if ox < W {
+                            let group = item * CHUNKS + (tile0 + i as u32) * 2 + part as u32 / 2;
+                            // safety: inside this warp's published tile
+                            let words = unsafe { lds4(tile_smem + part as u32 / 2 * GROUP_BYTES + column * 16) };
+                            // safety: inside the checked half output, 16-byte aligned; this
+                            // lane is the pixel's only writer
+                            unsafe { stg4(y_ptr.add(((group * HW + oy * W + ox) * 4) as usize), words) };
+                        }
+                        part += 1;
+                    }
+                    // closes this tile's reads before the next tile's stores
+                    sync_warp();
+                }
+                i += 1;
+            }
+            if HALF_OUT && output_out_of_range != 0 {
+                // safety: `range` holds at least one word, checked above
+                unsafe { flag_out_of_range(range.as_mut_ptr()) };
+            }
+        }
+    };
+}
+
+h16_conv3x3! {
+    /// FP16 `y = relu(conv3x3(x, weight) + bias [+ residual])` for 32 channels, stride 1,
+    /// on 80x998 inputs
+    ///
+    /// `x`, `y` and `residual` are `[batch, 32, 80, 998]`; `weight` comes from
+    /// [`spk_wideconv_pack_h16`]; `range` is one word the launch sets nonzero when an
+    /// activation saturates. Launch 128 threads with `grid = (16, 20, batch)` and
+    /// 12672 dynamic shared bytes
+    spk_wideconv_h16_c32,
+    channels = 32,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = false,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// FP16 `y = relu(conv3x3(x, weight) + bias [+ residual])` for 64 channels, stride 1,
+    /// on 40x499 inputs
+    ///
+    /// `x`, `y` and `residual` are `[batch, 64, 40, 499]`; `weight` comes from
+    /// [`spk_wideconv_pack_h16`]; `range` is one word the launch sets nonzero when an
+    /// activation saturates. Launch 128 threads with `grid = (8, 10, batch)` and
+    /// 12672 dynamic shared bytes
+    spk_wideconv_h16_c64,
+    channels = 64,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = false,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c32`, writing `y` as the half `[batch, 4, 80, 998, 8]`
+    /// tensor `spk_wideconv_h16_c32_half_in` reads, for a block's first convolution
+    spk_wideconv_h16_c32_half_out,
+    channels = 32,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = false,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c32`, reading `x` as the half tensor
+    /// `spk_wideconv_h16_c32_half_out` writes, for a block's second convolution
+    spk_wideconv_h16_c32_half_in,
+    channels = 32,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c64`, writing `y` as the half `[batch, 8, 40, 499, 8]`
+    /// tensor `spk_wideconv_h16_c64_half_in` reads, for a block's first convolution
+    spk_wideconv_h16_c64_half_out,
+    channels = 64,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = false,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c64`, reading `x` as the half tensor
+    /// `spk_wideconv_h16_c64_half_out` writes, for a block's second convolution
+    spk_wideconv_h16_c64_half_in,
+    channels = 64,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c32`, reading `x` and writing `y` as half tensors, for a block's first
+    /// convolution on a half block input, or the second convolution of a layer's first
+    /// block, whose FP32 residual is the layer input
+    spk_wideconv_h16_c32_half_in_out,
+    channels = 32,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c32`, with `x`, `residual` and `y` all half tensors, for the second
+    /// convolution of a block between a layer's first and last
+    spk_wideconv_h16_c32_half_all,
+    channels = 32,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = true,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c32`, reading `x` and `residual` as half tensors and writing `y` as FP32,
+    /// for the second convolution of a layer's last block
+    spk_wideconv_h16_c32_half_in_res,
+    channels = 32,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = true,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c64`, reading `x` and writing `y` as half tensors, for a block's first
+    /// convolution on a half block input, or the second convolution of a layer's first
+    /// block, whose FP32 residual is the layer input
+    spk_wideconv_h16_c64_half_in_out,
+    channels = 64,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c64`, with `x`, `residual` and `y` all half tensors, for the second
+    /// convolution of a block between a layer's first and last
+    spk_wideconv_h16_c64_half_all,
+    channels = 64,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = true,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c64`, reading `x` and `residual` as half tensors and writing `y` as FP32,
+    /// for the second convolution of a layer's last block
+    spk_wideconv_h16_c64_half_in_res,
+    channels = 64,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 1,
+    rows = 4,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = true,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// FP16 `y = relu(conv3x3(x, weight) + bias [+ residual])` for 128 channels, stride 1,
+    /// on 20x250 inputs
+    ///
+    /// `x`, `y` and `residual` are `[batch, 128, 20, 250]`; `weight` comes from
+    /// [`spk_wideconv_pack_h16`]; `range` is one word the launch sets nonzero when an
+    /// activation saturates. Launch 128 threads with `grid = (4, 10, batch)` and
+    /// 8448 dynamic shared bytes
+    spk_wideconv_h16_c128,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = false,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128` with 64 output channels per CTA, which doubles the
+    /// CTAs of small batches: `grid = (4, 10, batch * 2)`, 8448 dynamic shared bytes
+    spk_wideconv_h16_c128_narrow,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = false,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// FP16 `y = relu(conv3x3(x, weight) + bias [+ residual])` for 256 channels, stride 1,
+    /// on 10x125 inputs
+    ///
+    /// `x`, `y` and `residual` are `[batch, 256, 10, 125]`; `weight` comes from
+    /// [`spk_wideconv_pack_h16`]; `range` is one word the launch sets nonzero when an
+    /// activation saturates. Launch 128 threads with `grid = (2, 5, batch * 2)` and
+    /// 8448 dynamic shared bytes
+    spk_wideconv_h16_c256,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = false,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256` with 64 output channels per CTA, which doubles the
+    /// CTAs of small batches: `grid = (2, 5, batch * 4)`, 8448 dynamic shared bytes
+    spk_wideconv_h16_c256_narrow,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = false,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128_narrow`, writing `y` as the half `[batch, 16, 20, 250, 8]` tensor
+    /// `spk_wideconv_h16_c128_narrow_half_in` reads, for a block's first convolution
+    spk_wideconv_h16_c128_narrow_half_out,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = false,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128_narrow`, reading `x` as the half tensor
+    /// `spk_wideconv_h16_c128_narrow_half_out` writes, for a block's second convolution
+    spk_wideconv_h16_c128_narrow_half_in,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128_narrow`, reading `x` and writing `y` as half tensors, for a
+    /// block's first convolution on a half block input
+    spk_wideconv_h16_c128_narrow_half_in_out,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128_narrow`, with `x`, `residual` and `y` all half tensors, for the
+    /// second convolution of a block between a layer's first and last
+    spk_wideconv_h16_c128_narrow_half_all,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = true,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128_narrow`, reading `x` and `residual` as half tensors and writing `y` as
+    /// FP32, for the second convolution of a layer's last block
+    spk_wideconv_h16_c128_narrow_half_in_res,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = true,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256_narrow`, writing `y` as the half `[batch, 32, 10, 125, 8]` tensor
+    /// `spk_wideconv_h16_c256_narrow_half_in` reads, for a block's first convolution
+    spk_wideconv_h16_c256_narrow_half_out,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = false,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256_narrow`, reading `x` as the half tensor
+    /// `spk_wideconv_h16_c256_narrow_half_out` writes, for a block's second convolution
+    spk_wideconv_h16_c256_narrow_half_in,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256_narrow`, reading `x` and writing `y` as half tensors, for a
+    /// block's first convolution on a half block input
+    spk_wideconv_h16_c256_narrow_half_in_out,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256_narrow`, with `x`, `residual` and `y` all half tensors, for the
+    /// second convolution of a block between a layer's first and last
+    spk_wideconv_h16_c256_narrow_half_all,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = true,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256_narrow`, reading `x` and `residual` as half tensors and writing `y` as
+    /// FP32, for the second convolution of a layer's last block
+    spk_wideconv_h16_c256_narrow_half_in_res,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 3,
+    half_input = true,
+    half_residual = true,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128`, writing `y` as the half `[batch, 16, 20, 250, 8]` tensor
+    /// `spk_wideconv_h16_c128_half_in` reads, for a block's first convolution
+    spk_wideconv_h16_c128_half_out,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = false,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128`, reading `x` as the half tensor
+    /// `spk_wideconv_h16_c128_half_out` writes, for a block's second convolution
+    spk_wideconv_h16_c128_half_in,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128`, reading `x` and writing `y` as half tensors, for a
+    /// block's first convolution on a half block input
+    spk_wideconv_h16_c128_half_in_out,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128`, with `x`, `residual` and `y` all half tensors, for the
+    /// second convolution of a block between a layer's first and last
+    spk_wideconv_h16_c128_half_all,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = true,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c128`, reading `x` and `residual` as half tensors and writing `y` as
+    /// FP32, for the second convolution of a layer's last block
+    spk_wideconv_h16_c128_half_in_res,
+    channels = 128,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = true,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256`, writing `y` as the half `[batch, 32, 10, 125, 8]` tensor
+    /// `spk_wideconv_h16_c256_half_in` reads, for a block's first convolution
+    spk_wideconv_h16_c256_half_out,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = false,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256`, reading `x` as the half tensor
+    /// `spk_wideconv_h16_c256_half_out` writes, for a block's second convolution
+    spk_wideconv_h16_c256_half_in,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = false,
+    half_output = false,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256`, reading `x` and writing `y` as half tensors, for a
+    /// block's first convolution on a half block input
+    spk_wideconv_h16_c256_half_in_out,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = false,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256`, with `x`, `residual` and `y` all half tensors, for the
+    /// second convolution of a block between a layer's first and last
+    spk_wideconv_h16_c256_half_all,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = true,
+    half_output = true,
+}
+
+h16_conv3x3! {
+    /// As `spk_wideconv_h16_c256`, reading `x` and `residual` as half tensors and writing `y` as
+    /// FP32, for the second convolution of a layer's last block
+    spk_wideconv_h16_c256_half_in_res,
+    channels = 256,
+    h = 10,
+    w = 125,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+    half_input = true,
+    half_residual = true,
+    half_output = false,
+}
+
+/// Expands to one 3x3, stride-2, padding-1 FP16 convolution from `in_channels` to
+/// `out_channels` channels on `h x w` inputs
+///
+/// The tile is the stride-1 one with every output pixel reading the input at twice its
+/// coordinates, so a CTA stages `2 * rows + 1` input rows of `2 * 8 * n_tiles + 1`
+/// columns. A stage row keeps its even padded columns in one plane and its odd ones in
+/// another, `S2_ODD` pixels later: eight consecutive output columns of one tap then read
+/// eight consecutive 16-byte pixels of one plane, which `ldmatrix` serves without bank
+/// conflicts, and the odd plane's offset of 64 mod 128 bytes keeps the stores of
+/// neighbouring lanes, which alternate planes, on different banks
+macro_rules! h16_conv3x3_s2 {
+    (
+        $(#[$doc:meta])*
+        $name:ident,
+        in_channels = $cin:expr,
+        out_channels = $cout:expr,
+        h = $h:expr,
+        w = $w:expr,
+        m_tiles = $mt:expr,
+        channel_warps = $wm:expr,
+        rows = $rows:expr,
+        n_tiles = $nt:expr,
+        threads = $threads:literal,
+        min_blocks = $min_blocks:literal $(,)?
+    ) => {
+        // sm_70 has neither `ldmatrix` nor the m16n8k8 shape, so the sm70 variant computes
+        // the same tile with `wmma` m16n16k16 products over chunks of 16 input channels,
+        // as the stride-1 sm70 kernels do. The stage keeps the planes of the other tiers
+        // at 32 bytes per pixel, so the 16 output columns of one `wmma` tile read 16
+        // consecutive pixels of one plane, the column-major B operand `wmma.load.b` takes
+        #[cfg(feature = "tier-sm70")]
+        $(#[$doc])*
+        #[kernel]
+        #[launch_bounds($threads, $min_blocks)]
+        pub fn $name(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            residual: &[f32],
+            add_residual: u32,
+            batch: u32,
+            mut y: DisjointSlice<f32>,
+            mut range: DisjointSlice<f32>,
+        ) {
+            const CIN: u32 = $cin;
+            const C: u32 = $cout;
+            const H: u32 = $h;
+            const W: u32 = $w;
+            const HW: u32 = H * W;
+            const OH: u32 = (H - 1) / 2 + 1;
+            const OW: u32 = (W - 1) / 2 + 1;
+            const OHW: u32 = OH * OW;
+            const MT: usize = $mt;
+            const WM: u32 = $wm;
+            const ROWS: u32 = $rows;
+            const NT: usize = $nt;
+            const THREADS: u32 = $threads;
+            const COLS: u32 = NT as u32 * 8;
+            // n16 tiles of a warp's output row
+            const NJ: usize = NT / 2;
+            const CTA_CHANNELS: u32 = WM * MT as u32 * 16;
+            const BLOCKS: u32 = C / CTA_CHANNELS;
+            const TILES: u32 = C / 16;
+            // staged input rows and padded columns behind the tile
+            const IN_ROWS: u32 = 2 * ROWS + 1;
+            const IN_COLS: u32 = 2 * COLS + 1;
+            const PIXELS: u32 = IN_ROWS * IN_COLS;
+            // stage pixels per input row: `COLS + 1` even columns, then the odd plane
+            const S2_ODD: u32 = (COLS + 1).next_multiple_of(8) - 4;
+            const ROW_PIXELS: u32 = (S2_ODD + COLS).next_multiple_of(8);
+            const SLOTS: usize = PIXELS.div_ceil(THREADS) as usize;
+            const STAGE_BYTES: u32 = IN_ROWS * ROW_PIXELS * VOLTA_PIXEL_BYTES;
+            const CHUNKS: u32 = CIN / 16;
+            const _: () = assert!(
+                THREADS == 32 * WM * ROWS
+                    && C % CTA_CHANNELS == 0
+                    && NT == 8
+                    && C % 16 == 0
+                    && CIN % 16 == 0
+                    && S2_ODD >= COLS + 1
+                    && THREADS / 32 * VOLTA_EPILOGUE_BYTES <= 2 * STAGE_BYTES
+            );
+
+            let item = thread::blockIdx_z() / BLOCKS;
+            let block = thread::blockIdx_z() % BLOCKS;
+            let oy0 = thread::blockIdx_y() * ROWS;
+            let ox0 = thread::blockIdx_x() * COLS;
+            // the host sizes every buffer; a mismatch must not touch other memory
+            if (batch * CIN * HW) as usize > x.len()
+                || (batch * C * OHW) as usize > y.len()
+                || (add_residual != 0 && (batch * C * OHW) as usize > residual.len())
+                || (C * CIN * 9 / 2) as usize > weight.len()
+                || C as usize > bias.len()
+                || range.len() == 0
+                || item >= batch
+                || oy0 >= OH
+                || ox0 >= OW
+            {
+                return;
+            }
+            let base = item * CIN * HW;
+            let out_base = item * C * OHW;
+
+            let tid = thread::threadIdx_x();
+            let lane = tid % 32;
+            let warp = tid / 32;
+            let warp_m = warp % WM;
+            let warp_r = warp / WM;
+            // safety: the dynamic shared base of this CTA; only its address is taken
+            let smem = unsafe { cvta_generic_to_shared_u32(DynamicSharedArray::<f32, 32>::get() as *const u8) };
+            let x_ptr = x.as_ptr();
+            let w_ptr = weight.as_ptr();
+            let tile0 = block * (CTA_CHANNELS / 16) + warp_m * MT as u32;
+
+            let mut acc = [[[0.0f32; 8]; NJ]; MT];
+            let mut staged = [[0.0f32; 8]; SLOTS];
+            // nonzero once this thread converts an activation that saturates
+            let mut out_of_range = 0u32;
+
+            // iteration `i_stage` stages chunk `i_stage` while it computes the chunk before
+            // it, in two halves of eight channels, as in the stride-1 sm70 kernels
+            let mut i_stage = 0;
+            while i_stage <= CHUNKS {
+                let mut half = 0;
+                #[unroll]
+                while half < 2 {
+                    if i_stage < CHUNKS {
+                        let channels = base + (2 * i_stage + half as u32) * 8 * HW;
+                        let tid = opaque(tid);
+                        let mut k = 0;
+                        #[unroll]
+                        while k < SLOTS {
+                            let e = tid + k as u32 * THREADS;
+                            let r = e / IN_COLS;
+                            let column = e - r * IN_COLS;
+                            // padded coordinates, one above and left of the input's
+                            let iy = 2 * oy0 + r;
+                            let ix = 2 * ox0 + column;
+                            let inside = e < PIXELS && iy >= 1 && iy <= H && ix >= 1 && ix <= W;
+                            // padding loads the item's first word and discards it, so every
+                            // lane issues the same loads
+                            let offset = if inside { channels + (iy - 1) * W + ix - 1 } else { base };
+                            let mut ci = 0;
+                            #[unroll]
+                            while ci < 8 {
+                                // safety: inside the checked input
+                                let value = unsafe { ldg(x_ptr.add((offset + ci as u32 * HW) as usize)) };
+                                staged[k][ci] = if inside { value } else { 0.0 };
+                                ci += 1;
+                            }
+                            k += 1;
+                        }
+                    }
+                    if i_stage > 0 {
+                        let chunk = i_stage - 1;
+                        let stage = smem + chunk % 2 * STAGE_BYTES;
+                        // taps 0 to 4 run with the first half, 5 to 8 with the second, in a
+                        // rolled loop as in the stride-1 sm70 kernels
+                        let mut next = if half == 0 { 0 } else { 5 };
+                        let end = if half == 0 { 5 } else { 9 };
+                        while next < end {
+                            let tap = nounroll(next);
+                            let ky = tap / 3;
+                            let kx = tap - 3 * ky;
+                            // padded column `2 * ox + kx`: even plane `ox` for kx 0, odd
+                            // plane `ox` for kx 1, even plane `ox + 1` for kx 2
+                            let plane = if kx == 1 { S2_ODD } else { kx / 2 };
+                            let row = (2 * warp_r + ky) * ROW_PIXELS + plane;
+                            let mut b = [[0u32; 8]; NJ];
+                            let mut j = 0;
+                            #[unroll]
+                            while j < NJ {
+                                // safety: 16 pixels of one plane of this buffer's published stage
+                                b[j] = unsafe { wmma_load_b(stage + (row + j as u32 * 16) * VOLTA_PIXEL_BYTES) };
+                                j += 1;
+                            }
+                            let tiles = (chunk * 9 + tap) * TILES + tile0;
+                            let mut i = 0;
+                            #[unroll]
+                            while i < MT {
+                                // safety: a 512-byte tile inside the checked packed weights
+                                let a = unsafe { wmma_load_a(w_ptr.add(((tiles + i as u32) * 128) as usize)) };
+                                let mut j = 0;
+                                #[unroll]
+                                while j < NJ {
+                                    acc[i][j] = wmma_mma(acc[i][j], a, b[j]);
+                                    j += 1;
+                                }
+                                i += 1;
+                            }
+                            next = tap + 1;
+                        }
+                    }
+                    if i_stage < CHUNKS {
+                        let stage = smem + i_stage % 2 * STAGE_BYTES + half as u32 * 16;
+                        let tid = opaque(tid);
+                        let mut k = 0;
+                        #[unroll]
+                        while k < SLOTS {
+                            let e = tid + k as u32 * THREADS;
+                            if e < PIXELS {
+                                let r = e / IN_COLS;
+                                let column = e - r * IN_COLS;
+                                let pixel = r * ROW_PIXELS + column % 2 * S2_ODD + column / 2;
+                                let s = staged[k];
+                                let (w0, r0) = half2_checked(s[0], s[1]);
+                                let (w1, r1) = half2_checked(s[2], s[3]);
+                                let (w2, r2) = half2_checked(s[4], s[5]);
+                                let (w3, r3) = half2_checked(s[6], s[7]);
+                                out_of_range |= r0 | r1 | r2 | r3;
+                                // safety: this half of pixel `e` of the stage that no warp
+                                // reads until the barrier below
+                                unsafe { sts4(stage + pixel * VOLTA_PIXEL_BYTES, [w0, w1, w2, w3]) };
+                            }
+                            k += 1;
+                        }
+                    }
+                    half += 1;
+                }
+                // publishes the stored stage and closes every read of the stage the next
+                // iteration overwrites
+                thread::sync_threads();
+                i_stage += 1;
+            }
+            if out_of_range != 0 {
+                // safety: `range` holds at least one word, checked above
+                unsafe { flag_out_of_range(range.as_mut_ptr()) };
+            }
+
+            let oy = oy0 + warp_r;
+            if oy >= OH {
+                return;
+            }
+            // this warp's epilogue tile; the stages are free once the last barrier above
+            // closed their reads
+            let tile_smem = smem + warp * VOLTA_EPILOGUE_BYTES;
+            let residual_ptr = residual.as_ptr();
+            let bias_ptr = bias.as_ptr();
+            let row = out_base + oy * OW;
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                let mut j = 0;
+                #[unroll]
+                while j < NJ {
+                    // safety: this warp's tile, 64 bytes per 16 columns
+                    unsafe { wmma_store_tile(tile_smem + j as u32 * 64, acc[i][j]) };
+                    j += 1;
+                }
+                sync_warp();
+                // lane `l` takes columns `l` and `l + 32` of both eight-channel groups; the
+                // residual may alias the output, and each value is read by the lane that
+                // then writes it
+                let mut part = 0;
+                #[unroll]
+                while part < 4 {
+                    let column = lane + part as u32 % 2 * 32;
+                    let pair = part as u32 / 2;
+                    let ox = ox0 + column;
+                    if ox < OW {
+                        let channel0 = (tile0 + i as u32) * 16 + pair * 8;
+                        let mut v = [0.0f32; 8];
+                        let mut c = 0;
+                        #[unroll]
+                        while c < 8 {
+                            let address = tile_smem + ((pair * 8 + c as u32) * VOLTA_EPILOGUE_LD + column) * 4;
+                            // safety: inside this warp's published tile
+                            v[c] = (unsafe { lds_f32(address) }) * PRODUCT_UNSCALE;
+                            c += 1;
+                        }
+                        // the sum goes in before the bias, as cuDNN's fused call adds them
+                        if add_residual != 0 {
+                            let mut c = 0;
+                            #[unroll]
+                            while c < 8 {
+                                let index = row + (channel0 + c as u32) * OHW + ox;
+                                // safety: inside the checked residual
+                                v[c] += unsafe { *residual_ptr.add(index as usize) };
+                                c += 1;
+                            }
+                        }
+                        let mut c = 0;
+                        #[unroll]
+                        while c < 8 {
+                            let channel = channel0 + c as u32;
+                            // safety: `channel < C`, inside the checked bias
+                            let value = relu(v[c] + unsafe { *bias_ptr.add(channel as usize) });
+                            // safety: inside the checked output; this lane is its only writer
+                            unsafe { *y.get_unchecked_mut((row + channel * OHW + ox) as usize) = value };
+                            c += 1;
+                        }
+                    }
+                    part += 1;
+                }
+                // closes this tile's reads before the next tile's stores
+                sync_warp();
+                i += 1;
+            }
+        }
+
+        #[cfg(not(feature = "tier-sm70"))]
+        $(#[$doc])*
+        #[kernel]
+        #[launch_bounds($threads, $min_blocks)]
+        pub fn $name(
+            x: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            residual: &[f32],
+            add_residual: u32,
+            batch: u32,
+            mut y: DisjointSlice<f32>,
+            mut range: DisjointSlice<f32>,
+        ) {
+            const CIN: u32 = $cin;
+            const C: u32 = $cout;
+            const H: u32 = $h;
+            const W: u32 = $w;
+            const HW: u32 = H * W;
+            const OH: u32 = (H - 1) / 2 + 1;
+            const OW: u32 = (W - 1) / 2 + 1;
+            const OHW: u32 = OH * OW;
+            const MT: usize = $mt;
+            const WM: u32 = $wm;
+            const ROWS: u32 = $rows;
+            const NT: usize = $nt;
+            const THREADS: u32 = $threads;
+            const COLS: u32 = NT as u32 * 8;
+            const CTA_CHANNELS: u32 = WM * MT as u32 * 16;
+            const BLOCKS: u32 = C / CTA_CHANNELS;
+            const TILES: u32 = C / 16;
+            // staged input rows and padded columns behind the tile
+            const IN_ROWS: u32 = 2 * ROWS + 1;
+            const IN_COLS: u32 = 2 * COLS + 1;
+            const PIXELS: u32 = IN_ROWS * IN_COLS;
+            // stage pixels per input row: `COLS + 1` even columns, then the odd plane
+            const S2_ODD: u32 = (COLS + 1).next_multiple_of(8) - 4;
+            const ROW_PIXELS: u32 = (S2_ODD + COLS).next_multiple_of(8);
+            const SLOTS: usize = PIXELS.div_ceil(THREADS) as usize;
+            const STAGE_BYTES: u32 = IN_ROWS * ROW_PIXELS * 16;
+            const CHUNKS: u32 = CIN / 8;
+            const STEPS: u32 = CHUNKS * 9;
+            const _: () = assert!(
+                THREADS == 32 * WM * ROWS
+                    && C % CTA_CHANNELS == 0
+                    && NT % 4 == 0
+                    && C % 16 == 0
+                    && CIN % 8 == 0
+                    && S2_ODD % 8 == 4
+                    && S2_ODD >= COLS + 1
+            );
+
+            let item = thread::blockIdx_z() / BLOCKS;
+            let block = thread::blockIdx_z() % BLOCKS;
+            let oy0 = thread::blockIdx_y() * ROWS;
+            let ox0 = thread::blockIdx_x() * COLS;
+            // the host sizes every buffer; a mismatch must not touch other memory
+            if (batch * CIN * HW) as usize > x.len()
+                || (batch * C * OHW) as usize > y.len()
+                || (add_residual != 0 && (batch * C * OHW) as usize > residual.len())
+                || (C * CIN * 9 / 2) as usize > weight.len()
+                || C as usize > bias.len()
+                || range.len() == 0
+                || item >= batch
+                || oy0 >= OH
+                || ox0 >= OW
+            {
+                return;
+            }
+            let base = item * CIN * HW;
+            let out_base = item * C * OHW;
+
+            let tid = thread::threadIdx_x();
+            let lane = tid % 32;
+            let warp = tid / 32;
+            let warp_m = warp % WM;
+            let warp_r = warp / WM;
+            let g = lane / 4;
+            let t = lane % 4;
+            // safety: the dynamic shared base of this CTA; only its address is taken
+            let smem = unsafe { cvta_generic_to_shared_u32(DynamicSharedArray::<f32, 16>::get() as *const u8) };
+            let x_ptr = x.as_ptr();
+            // this lane's `ldmatrix` row for tap (0, 0) and fragments 0..4: staged input
+            // row `2 * warp_r`, even-plane pixel `lane`, which is output column `lane % 8`
+            // of fragment `lane / 8`
+            let lane_row = (2 * warp_r * ROW_PIXELS + lane) * 16;
+            let tile0 = block * (CTA_CHANNELS / 16) + warp_m * MT as u32;
+            // safety: offsets below stay inside the checked packed weights
+            let wp = unsafe { weight.as_ptr().add(((tile0 * 32 + lane) * 2) as usize) };
+
+            let mut ring = [[[0u32; 2]; MT]; 3];
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                ring[0][i] = fragment_at!(wp, 0, i as u32);
+                ring[1][i] = fragment_at!(wp, 1, i as u32);
+                i += 1;
+            }
+            let mut acc = [[[0.0f32; 4]; NT]; MT];
+            let mut staged = [[0.0f32; 8]; SLOTS];
+            // nonzero once this thread converts an activation that saturates
+            let mut out_of_range = 0u32;
+
+            // iteration `i_stage` loads chunk `i_stage`, computes the chunk before it,
+            // then stores the loaded chunk, as in the stride-1 kernels
+            let mut i_stage = 0;
+            while i_stage <= CHUNKS {
+                if i_stage < CHUNKS {
+                    let channels = base + i_stage * 8 * HW;
+                    let tid = opaque(tid);
+                    let mut k = 0;
+                    #[unroll]
+                    while k < SLOTS {
+                        let e = tid + k as u32 * THREADS;
+                        let r = e / IN_COLS;
+                        let column = e - r * IN_COLS;
+                        // padded coordinates, one above and left of the input's
+                        let iy = 2 * oy0 + r;
+                        let ix = 2 * ox0 + column;
+                        let inside = e < PIXELS && iy >= 1 && iy <= H && ix >= 1 && ix <= W;
+                        // padding loads the item's first word and discards it, so every
+                        // lane issues the same loads
+                        let offset = if inside { channels + (iy - 1) * W + ix - 1 } else { base };
+                        let mut ci = 0;
+                        #[unroll]
+                        while ci < 8 {
+                            // safety: inside the checked input
+                            let value = unsafe { ldg(x_ptr.add((offset + ci as u32 * HW) as usize)) };
+                            staged[k][ci] = if inside { value } else { 0.0 };
+                            ci += 1;
+                        }
+                        k += 1;
+                    }
+                }
+                if i_stage > 0 {
+                    let chunk = i_stage - 1;
+                    let stage = smem + chunk % 2 * STAGE_BYTES + lane_row;
+                    #[cfg(feature = "tier-sm120")]
+                    let mut held = ([[0u32; 2]; MT], [0u32; NT]);
+                    let mut tap = 0;
+                    #[unroll]
+                    while tap < 9 {
+                        let step = chunk * 9 + tap as u32 + 2;
+                        let step = if step >= STEPS { step - STEPS } else { step };
+                        let mut i = 0;
+                        #[unroll]
+                        while i < MT {
+                            ring[(tap + 2) % 3][i] = fragment_at!(wp, step, i as u32);
+                            i += 1;
+                        }
+                        let (ky, kx) = (tap as u32 / 3, tap as u32 % 3);
+                        // padded column `2 * ox + kx`: even plane `ox` for kx 0, odd
+                        // plane `ox` for kx 1, even plane `ox + 1` for kx 2
+                        let plane = if kx == 1 { S2_ODD } else { kx / 2 };
+                        let tap_offset = (ky * ROW_PIXELS + plane) * 16;
+                        let mut b = [0u32; NT];
+                        let mut q = 0;
+                        #[unroll]
+                        while q < NT / 4 {
+                            // safety: the row lies inside this buffer's published stage
+                            let quad = unsafe { ldsm4(stage + tap_offset + q as u32 * 32 * 16) };
+                            b[4 * q] = quad[0];
+                            b[4 * q + 1] = quad[1];
+                            b[4 * q + 2] = quad[2];
+                            b[4 * q + 3] = quad[3];
+                            q += 1;
+                        }
+                        #[cfg(not(feature = "tier-sm120"))]
+                        {
+                            let mut j = 0;
+                            #[unroll]
+                            while j < NT {
+                                let mut i = 0;
+                                #[unroll]
+                                while i < MT {
+                                    acc[i][j] = mma(acc[i][j], ring[tap % 3][i], b[j]);
+                                    i += 1;
+                                }
+                                j += 1;
+                            }
+                        }
+                        #[cfg(feature = "tier-sm120")]
+                        {
+                            let mut j = 0;
+                            #[unroll]
+                            while j < NT {
+                                let mut i = 0;
+                                #[unroll]
+                                while i < MT {
+                                    let (a, c) = (ring[tap % 3][i], acc[i][j]);
+                                    acc[i][j] = tap_product(c, tap, held.0[i], a, held.1[j], b[j]);
+                                    i += 1;
+                                }
+                                j += 1;
+                            }
+                            if holds(tap) {
+                                held = (ring[tap % 3], b);
+                            }
+                        }
+                        tap += 1;
+                    }
+                }
+                if i_stage < CHUNKS {
+                    let stage = smem + i_stage % 2 * STAGE_BYTES;
+                    let tid = opaque(tid);
+                    let mut k = 0;
+                    #[unroll]
+                    while k < SLOTS {
+                        let e = tid + k as u32 * THREADS;
+                        if e < PIXELS {
+                            let r = e / IN_COLS;
+                            let column = e - r * IN_COLS;
+                            let pixel = r * ROW_PIXELS + column % 2 * S2_ODD + column / 2;
+                            let s = staged[k];
+                            let (w0, r0) = half2_checked(s[0], s[1]);
+                            let (w1, r1) = half2_checked(s[2], s[3]);
+                            let (w2, r2) = half2_checked(s[4], s[5]);
+                            let (w3, r3) = half2_checked(s[6], s[7]);
+                            out_of_range |= r0 | r1 | r2 | r3;
+                            let words = [w0, w1, w2, w3];
+                            // safety: pixel `e` of the stage that no warp reads until
+                            // the barrier below
+                            unsafe { sts4(stage + pixel * 16, words) };
+                        }
+                        k += 1;
+                    }
+                }
+                // publishes the stored stage and closes every read of the stage the next
+                // iteration overwrites
+                thread::sync_threads();
+                i_stage += 1;
+            }
+            if out_of_range != 0 {
+                // safety: `range` holds at least one word, checked above
+                unsafe { flag_out_of_range(range.as_mut_ptr()) };
+            }
+
+            let oy = oy0 + warp_r;
+            if oy >= OH {
+                return;
+            }
+            let row = out_base + oy * OW;
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                let mut slot = 0;
+                #[unroll]
+                while slot < 4 {
+                    let mut j = 0;
+                    #[unroll]
+                    while j < NT {
+                        acc[i][j][slot] *= PRODUCT_UNSCALE;
+                        j += 1;
+                    }
+                    slot += 1;
+                }
+                i += 1;
+            }
+            // the residual may alias the output, so reading it all before any store lets
+            // the loads overlap; the sum goes in before the bias, as cuDNN's fused call
+            // adds them
+            if add_residual != 0 {
+                let residual_ptr = residual.as_ptr();
+                let mut i = 0;
+                #[unroll]
+                while i < MT {
+                    let mut slot = 0;
+                    #[unroll]
+                    while slot < 4 {
+                        let channel = (tile0 + i as u32) * 16 + g + slot as u32 / 2 * 8;
+                        let channel_row = row + channel * OHW;
+                        let mut j = 0;
+                        #[unroll]
+                        while j < NT {
+                            let ox = ox0 + j as u32 * 8 + 2 * t + slot as u32 % 2;
+                            if ox < OW {
+                                // safety: inside the checked residual
+                                acc[i][j][slot] += unsafe { *residual_ptr.add((channel_row + ox) as usize) };
+                            }
+                            j += 1;
+                        }
+                        slot += 1;
+                    }
+                    i += 1;
+                }
+            }
+
+            let bias_ptr = bias.as_ptr();
+            let mut i = 0;
+            #[unroll]
+            while i < MT {
+                let mut slot = 0;
+                #[unroll]
+                while slot < 4 {
+                    let channel = (tile0 + i as u32) * 16 + g + slot as u32 / 2 * 8;
+                    // safety: `channel < C`, inside the checked bias
+                    let b = unsafe { *bias_ptr.add(channel as usize) };
+                    let channel_row = row + channel * OHW;
+                    let mut j = 0;
+                    #[unroll]
+                    while j < NT {
+                        let ox = ox0 + j as u32 * 8 + 2 * t + slot as u32 % 2;
+                        if ox < OW {
+                            // safety: inside the checked output; this lane is its only writer
+                            unsafe { *y.get_unchecked_mut((channel_row + ox) as usize) = relu(acc[i][j][slot] + b) };
+                        }
+                        j += 1;
+                    }
+                    slot += 1;
+                }
+                i += 1;
+            }
+        }
+    };
+}
+
+h16_conv3x3_s2! {
+    /// FP16 `y = relu(conv3x3(x, weight, stride 2) + bias [+ residual])` from 32 to 64
+    /// channels on 80x998 inputs
+    ///
+    /// `x` is `[batch, 32, 80, 998]`, `y` and `residual` are `[batch, 64, 40, 499]`;
+    /// `weight` comes from [`spk_wideconv_pack_h16`]; `range` is one word the launch sets
+    /// nonzero when an activation saturates. Launch 128 threads with
+    /// `grid = (8, 20, batch)` and 21760 dynamic shared bytes
+    spk_wideconv_h16_c32s2,
+    in_channels = 32,
+    out_channels = 64,
+    h = 80,
+    w = 998,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+}
+
+h16_conv3x3_s2! {
+    /// FP16 `y = relu(conv3x3(x, weight, stride 2) + bias [+ residual])` from 64 to 128
+    /// channels on 40x499 inputs
+    ///
+    /// `x` is `[batch, 64, 40, 499]`, `y` and `residual` are `[batch, 128, 20, 250]`;
+    /// `weight` comes from [`spk_wideconv_pack_h16`]; `range` is one word the launch sets
+    /// nonzero when an activation saturates. Launch 128 threads with
+    /// `grid = (4, 10, batch)` and 21760 dynamic shared bytes
+    spk_wideconv_h16_c64s2,
+    in_channels = 64,
+    out_channels = 128,
+    h = 40,
+    w = 499,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+}
+
+h16_conv3x3_s2! {
+    /// As `spk_wideconv_h16_c64s2` with 64 output channels per CTA, which doubles the
+    /// CTAs of small batches: `grid = (4, 10, batch * 2)`, 21760 dynamic shared bytes
+    spk_wideconv_h16_c64s2_narrow,
+    in_channels = 64,
+    out_channels = 128,
+    h = 40,
+    w = 499,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+}
+
+h16_conv3x3_s2! {
+    /// FP16 `y = relu(conv3x3(x, weight, stride 2) + bias [+ residual])` from 128 to
+    /// 256 channels on 20x250 inputs
+    ///
+    /// `x` is `[batch, 128, 20, 250]`, `y` and `residual` are `[batch, 256, 10, 125]`;
+    /// `weight` comes from [`spk_wideconv_pack_h16`]; `range` is one word the launch sets
+    /// nonzero when an activation saturates. Launch 128 threads with
+    /// `grid = (2, 5, batch * 2)` and 21760 dynamic shared bytes
+    spk_wideconv_h16_c128s2,
+    in_channels = 128,
+    out_channels = 256,
+    h = 20,
+    w = 250,
+    m_tiles = 4,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+}
+
+h16_conv3x3_s2! {
+    /// As `spk_wideconv_h16_c128s2` with 64 output channels per CTA, which doubles the
+    /// CTAs of small batches: `grid = (2, 5, batch * 4)`, 21760 dynamic shared bytes
+    spk_wideconv_h16_c128s2_narrow,
+    in_channels = 128,
+    out_channels = 256,
+    h = 20,
+    w = 250,
+    m_tiles = 2,
+    channel_warps = 2,
+    rows = 2,
+    n_tiles = 8,
+    threads = 128,
+    min_blocks = 2,
+}

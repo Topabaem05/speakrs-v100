@@ -1,0 +1,23 @@
+[package]
+name = "volta-tc-kernels"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike: Volta (sm_70) tensor-core instructions through cuda-oxide ptx_asm!"
+
+# standalone like speakrs's kernel crate: cuda-oxide needs its pinned nightly
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# spell wmma with `.aligned`, which PTX ISA 6.3 and newer require. cuda-oxide emits PTX
+# 6.0 for sm_70, so this needs the llc wrapper that raises the module to 6.5
+aligned = []
+# add the m8n8k4 kernel, which needs PTX ISA 6.4, so also the wrapper
+m8n8k4 = []
+
+[dependencies]
+# the rev speakrs pins
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "918bbde123671153b29a89542f1781f1c7494c14" }

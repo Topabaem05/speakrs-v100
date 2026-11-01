@@ -1,0 +1,4 @@
+# the nightly that cuda-oxide 918bbde pins, as in speakrs's kernel crate
+[toolchain]
+channel = "nightly-2026-08-28"
+components = ["rust-src", "rustc-dev", "llvm-tools", "rustfmt", "clippy"]

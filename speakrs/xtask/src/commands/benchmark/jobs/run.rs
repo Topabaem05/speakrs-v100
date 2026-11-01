@@ -1,0 +1,381 @@
+#[cfg(feature = "_cuda")]
+use std::collections::HashMap;
+#[cfg(feature = "_cuda")]
+use std::fs;
+use std::path::{Path, PathBuf};
+#[cfg(feature = "_cuda")]
+use std::time::Duration;
+
+use color_eyre::eyre::{Result, bail};
+
+use super::super::BenchmarkMetadata;
+#[cfg(feature = "_cuda")]
+use super::super::{
+    BatchCommandRunner, DerAccumulation, DerImplResult, DerResultsWriter, ImplType, format_eta,
+    now_stamp,
+};
+use super::gpu::resolve_gpu_impls;
+use super::preflight::preflight;
+use super::{BenchmarkJobConfig, BenchmarkJobResult, GpuBenchmarkSuiteConfig, ProgressUpdate};
+#[cfg(feature = "_cuda")]
+use crate::catalog::ImplementationId;
+#[cfg(feature = "_cuda")]
+use crate::commands::benchmark::run_store::DatasetIdentity;
+use crate::commands::benchmark::run_store::{BenchmarkRun, RunIdentity};
+use crate::commands::benchmark::runner::BatchRunOutput;
+
+pub fn run_gpu_benchmark_suite(config: &GpuBenchmarkSuiteConfig) -> Result<()> {
+    let datasets_list: Vec<crate::datasets::Dataset> = if config.dataset == "all" {
+        crate::datasets::all_datasets()
+    } else {
+        vec![
+            crate::datasets::find_dataset(&config.dataset).ok_or_else(|| {
+                color_eyre::eyre::eyre!(
+                    "unknown dataset: {}. Use --dataset list to see available datasets",
+                    config.dataset
+                )
+            })?,
+        ]
+    };
+
+    let implementations = resolve_gpu_impls(&config.impls);
+    let multi_dataset = datasets_list.len() > 1;
+
+    let suite = BenchmarkRun::create(
+        &config.results_dir,
+        implementations.iter().map(|(id, _)| *id).collect(),
+        datasets_list
+            .iter()
+            .map(|dataset| dataset.catalog_id())
+            .collect::<Result<Vec<_>>>()?,
+        config.description.clone(),
+        chrono::Local::now(),
+        BenchmarkMetadata::collect().cpu,
+    )?;
+
+    if !config.no_preflight {
+        preflight(
+            &datasets_list,
+            &config.datasets_dir,
+            &implementations,
+            &config.models_dir,
+            &config.root,
+            config.pyannote_batch_sizes,
+        )?;
+    }
+
+    for dataset in datasets_list {
+        let job_config = BenchmarkJobConfig {
+            models_dir: config.models_dir.clone(),
+            datasets_dir: config.datasets_dir.clone(),
+            root: config.root.clone(),
+            results_dir: config.results_dir.clone(),
+            dataset,
+            implementations: implementations.clone(),
+            max_files: config.max_files,
+            max_minutes: config.max_minutes,
+            description: config.description.clone(),
+            multi_dataset,
+            pyannote_batch_sizes: config.pyannote_batch_sizes,
+        };
+
+        run_benchmark_job(&job_config, None, Some(&suite.identity))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "_cuda")]
+pub fn run_benchmark_job(
+    config: &BenchmarkJobConfig,
+    progress_cb: Option<&(dyn Fn(&ProgressUpdate) + Send + Sync)>,
+    run_identity: Option<&RunIdentity>,
+) -> Result<BenchmarkJobResult> {
+    use crate::cmd::wav_duration_seconds;
+
+    let metadata = BenchmarkMetadata::collect();
+
+    println!();
+    println!("========== {} ==========", config.dataset.display_name);
+
+    config.dataset.ensure(&config.datasets_dir)?;
+    let snapshot = config.dataset.verified_snapshot(&config.datasets_dir)?;
+    let pairs = snapshot
+        .files()
+        .iter()
+        .map(|file| {
+            (
+                file.wav().to_owned(),
+                file.rttm().to_owned(),
+                file.duration_seconds(),
+            )
+        })
+        .collect();
+    let files = super::super::selection::select_pairs_for_benchmark(
+        pairs,
+        config.max_files,
+        config.max_minutes as f64,
+    );
+    if files.is_empty() {
+        bail!(
+            "dataset {} snapshot produced no files after selection caps",
+            config.dataset.id
+        );
+    }
+
+    let total_audio_seconds: f64 = files
+        .iter()
+        .map(|(wav, _)| wav_duration_seconds(wav).unwrap_or(0.0))
+        .sum();
+    let total_audio_minutes = total_audio_seconds / 60.0;
+
+    let owned_suite;
+    let suite = if let Some(run_identity) = run_identity {
+        run_identity
+    } else {
+        owned_suite = BenchmarkRun::create(
+            &config.results_dir,
+            config.implementations.iter().map(|(id, _)| *id).collect(),
+            vec![config.dataset.catalog_id()?],
+            config.description.clone(),
+            chrono::Local::now(),
+            metadata.cpu.clone(),
+        )?;
+        &owned_suite.identity
+    };
+    let run_id = suite.run_id.as_str().to_owned();
+    let run_dir = if config.multi_dataset || suite.datasets.len() > 1 {
+        let dir = suite.run_id.as_str();
+        let run_dir = config.results_dir.join(dir).join(&config.dataset.id);
+        fs::create_dir_all(&run_dir)?;
+        run_dir
+    } else {
+        let run_dir = config.results_dir.join(&run_id);
+        fs::create_dir_all(&run_dir)?;
+        run_dir
+    };
+
+    if let Some(ref description) = config.description {
+        fs::write(run_dir.join("README.md"), format!("{description}\n"))?;
+    }
+
+    println!(
+        "Found {} files, {total_audio_minutes:.1} min total audio",
+        files.len()
+    );
+    println!("Run ID: {run_id}");
+    println!();
+
+    let batch_timeout = Duration::from_secs_f64((total_audio_seconds * 5.0).max(120.0));
+    let wav_paths: Vec<&Path> = files.iter().map(|(wav, _)| wav.as_path()).collect();
+    let mut all_results: HashMap<ImplementationId, DerImplResult> = HashMap::new();
+
+    for (implementation_id, impl_type) in &config.implementations {
+        let impl_name = crate::catalog::ImplementationCatalog::display_name(*implementation_id);
+        println!("Running {impl_name}...");
+
+        let benchmark_result = match impl_type {
+            ImplType::Speakrs(mode) => {
+                run_speakrs_gpu(&config.models_dir, &files, mode, progress_cb)
+            }
+            ImplType::Pyannote(device) => BatchCommandRunner::pyannote(
+                &config.root,
+                device,
+                &wav_paths,
+                config.pyannote_batch_sizes,
+            )
+            .run_with_retries(batch_timeout),
+            _ => {
+                println!("  → skipped: not a GPU implementation");
+                println!();
+                let result = DerImplResult::skipped("not a GPU implementation".to_string());
+                all_results.insert(*implementation_id, result);
+                continue;
+            }
+        };
+
+        let benchmark_output = match benchmark_result {
+            Ok(result) => result,
+            Err(err) => {
+                println!("  → failed: {err}");
+                println!();
+                let result = DerImplResult::failed(err.to_string());
+                all_results.insert(*implementation_id, result);
+                continue;
+            }
+        };
+
+        let acc = DerAccumulation::compute(&files, &benchmark_output.per_file_rttm)?;
+        let (der_pct, miss_pct, fa_pct, conf_pct) = acc.der_percentages();
+
+        let rtfx = total_audio_seconds / benchmark_output.total_seconds;
+        if let Some(der) = der_pct {
+            println!(
+                "  → DER: {der:.1}%, Missed: {:.1}%, FA: {:.1}%, Confusion: {:.1}%, Time: {:.1}s, RTFx: {rtfx:.1}x",
+                miss_pct.unwrap_or(0.0),
+                fa_pct.unwrap_or(0.0),
+                conf_pct.unwrap_or(0.0),
+                benchmark_output.total_seconds,
+            );
+        } else {
+            println!(
+                "  → N/A, Time: {:.1}s, RTFx: {rtfx:.1}x",
+                benchmark_output.total_seconds
+            );
+        }
+        println!();
+
+        let mut result = DerImplResult::completed(
+            der_pct,
+            miss_pct,
+            fa_pct,
+            conf_pct,
+            benchmark_output.total_seconds,
+            acc.file_count,
+        );
+        result.per_file = acc.per_file().to_vec();
+        result.hypotheses = benchmark_output.per_file_rttm;
+        all_results.insert(*implementation_id, result);
+    }
+
+    DerResultsWriter {
+        run_dir: &run_dir,
+        run_identity: suite,
+        dataset: DatasetIdentity::catalog(config.dataset.catalog_id()?),
+        implementations: &config.implementations,
+        results: &all_results,
+        files: &files,
+        total_audio_minutes,
+        collar: 0.0,
+        description: config.description.as_deref(),
+        max_files: config.max_files,
+        max_minutes: config.max_minutes,
+        metadata: &metadata,
+        pyannote_batch_sizes: config.pyannote_batch_sizes,
+    }
+    .write()?;
+
+    Ok(BenchmarkJobResult {
+        run_id,
+        run_dir,
+        total_audio_minutes,
+        results: all_results,
+    })
+}
+
+#[cfg(not(feature = "_cuda"))]
+pub fn run_benchmark_job(
+    _config: &BenchmarkJobConfig,
+    _progress_cb: Option<&(dyn Fn(&ProgressUpdate) + Send + Sync)>,
+    _run_identity: Option<&RunIdentity>,
+) -> Result<BenchmarkJobResult> {
+    bail!("xtask benchmark jobs require a CUDA backend feature")
+}
+
+#[cfg(feature = "_cuda")]
+pub fn run_speakrs_gpu(
+    models_dir: &Path,
+    files: &[(PathBuf, PathBuf)],
+    mode: &str,
+    progress_cb: Option<&(dyn Fn(&ProgressUpdate) + Send + Sync)>,
+) -> Result<BatchRunOutput> {
+    use speakrs::inference::{EmbeddingModel, ExecutionMode, SegmentationModel};
+    use speakrs::pipeline::{
+        BatchStreamError, CUDA_SEGMENTATION_STEP_SECONDS, DiarizationPipeline,
+        FAST_SEGMENTATION_STEP_SECONDS,
+    };
+
+    use crate::wav;
+
+    let execution_mode = match mode {
+        "cuda-fast" => ExecutionMode::CudaFast,
+        _ => ExecutionMode::Cuda,
+    };
+    let step = match execution_mode {
+        ExecutionMode::CudaFast => FAST_SEGMENTATION_STEP_SECONDS,
+        _ => CUDA_SEGMENTATION_STEP_SECONDS,
+    };
+    let mut seg_model = SegmentationModel::with_mode(
+        models_dir.join("segmentation-3.0.onnx"),
+        step as f32,
+        execution_mode,
+    )?;
+    let mut emb_model = EmbeddingModel::with_mode(
+        models_dir.join("wespeaker-voxceleb-resnet34.onnx"),
+        execution_mode,
+    )?;
+    let mut pipeline = DiarizationPipeline::new(&mut seg_model, &mut emb_model, models_dir)?;
+
+    let total_files = files.len();
+    let start = std::time::Instant::now();
+    // the batch stream decodes the next files on worker threads and clusters each file
+    // while the GPU runs the next one, as `xtask diarize` and the library batch API do
+    let decoder = wav::WavBatchDecoder::new(files.iter().map(|(wav, _)| wav.clone()).collect())?;
+    let mut finished = 0;
+    let mut file_start = start;
+    let mut report = |file_id: &str| {
+        let file_elapsed = file_start.elapsed().as_secs_f64();
+        file_start = std::time::Instant::now();
+        let cumulative = start.elapsed().as_secs_f64();
+        finished += 1;
+        let remaining = (total_files - finished) as f64 * cumulative / finished as f64;
+        eprintln!(
+            "  [{finished}/{total_files}] {file_id}: {file_elapsed:.1}s (elapsed {}, ETA {}) [{}]",
+            format_eta(cumulative),
+            format_eta(remaining),
+            now_stamp()
+        );
+        if let Some(callback) = progress_cb {
+            callback(&ProgressUpdate {
+                impl_name: format!("speakrs {mode}"),
+                file_index: (finished - 1) as u32,
+                total_files: total_files as u32,
+                file_id: file_id.to_owned(),
+                elapsed_secs: file_elapsed,
+            });
+        }
+    };
+
+    // the stream asks for the next file once the previous file's inference is done
+    let mut previous: Option<String> = None;
+    let inputs = decoder.inspect(|input| {
+        if let Some(file_id) = previous.take() {
+            report(&file_id);
+        }
+        previous = input.as_ref().ok().map(|input| input.file_id.clone());
+    });
+    let outputs = pipeline
+        .run_batch_stream(inputs)
+        .map_err(|error| match error {
+            BatchStreamError::Input(error) => error,
+            BatchStreamError::Pipeline(error) => error.into(),
+        })?;
+    if let Some(file_id) = previous.take() {
+        report(&file_id);
+    }
+
+    // RTTM formatting stays inside the timer, as it was per file before
+    let per_file_rttm = outputs
+        .into_iter()
+        .map(|output| {
+            let rttm = output.result.rttm(&output.file_id);
+            (output.file_id, rttm)
+        })
+        .collect();
+    let total_seconds = start.elapsed().as_secs_f64();
+
+    Ok(BatchRunOutput {
+        total_seconds,
+        per_file_rttm,
+    })
+}
+
+#[cfg(not(feature = "_cuda"))]
+pub fn run_speakrs_gpu(
+    _models_dir: &Path,
+    _files: &[(PathBuf, PathBuf)],
+    _mode: &str,
+    _progress_cb: Option<&(dyn Fn(&ProgressUpdate) + Send + Sync)>,
+) -> Result<BatchRunOutput> {
+    bail!("xtask GPU benchmark path requires a CUDA backend feature")
+}

@@ -1,0 +1,163 @@
+use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode, cuGraphGetNodes};
+use cudarc::driver::{CudaContext, CudaGraph};
+
+use crate::{Error, Gpu};
+
+/// A recorded and instantiated sequence of work on one [`Gpu`]'s stream
+///
+/// The graph holds raw pointers to every buffer the captured work touched. Creating one
+/// is `unsafe` ([`Gpu::capture`]) because nothing ties those buffers' lifetimes to
+/// [`Self::launch`]: every launch must find them allocated at their captured addresses,
+/// so allocate them once and refill them instead of reallocating. Dropping the graph
+/// only destroys its driver handles, so a graph that is never launched again may
+/// outlive its buffers. Replays record no cudarc events, so until a queued replay has
+/// finished its buffers must stay allocated and be used only on this GPU's stream;
+/// dropping the graph does not wait for it
+///
+/// `Send` but not `Sync`: driver graph handles work from any thread, but CUDA forbids
+/// using one executable graph from two threads at once
+pub struct Graph(CudaGraph);
+
+// SAFETY: the raw graph and executable handles are driver objects usable from any
+// thread, and cudarc's launch binds the graph's context first. Without `Sync`, only
+// one thread can reach a graph at a time
+unsafe impl Send for Graph {}
+
+impl std::fmt::Debug for Graph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Graph")
+    }
+}
+
+impl Graph {
+    /// Queues one replay on the stream it was captured from
+    pub fn launch(&self) -> Result<(), Error> {
+        self.0.launch()?;
+        Ok(())
+    }
+
+    /// The cudarc graph, for driver calls cudakit does not wrap
+    pub fn as_cuda(&self) -> &CudaGraph {
+        &self.0
+    }
+}
+
+impl Gpu {
+    /// Records everything `enqueue` queues on this GPU's stream, or `None` when it
+    /// queued nothing
+    ///
+    /// Waits for prior work first, so nothing queued before the capture is pending when
+    /// it starts; finish lazy library setup and weight uploads before calling this.
+    /// cudarc's per-buffer event tracking is paused during the capture, since waiting
+    /// on an event recorded before the capture fails with
+    /// `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`. The capture ends even when `enqueue`
+    /// returns an error, so a failed `enqueue` leaves the stream usable; a panic in
+    /// `enqueue` unwinds without ending it
+    ///
+    /// # Safety
+    ///
+    /// Every launch of the returned graph must find every buffer `enqueue` touched
+    /// still allocated at the address it had during capture; otherwise a replay reads
+    /// or writes freed device memory. Either keep the buffers alive and in place for as
+    /// long as the graph exists, or make it impossible to launch the graph once any of
+    /// them is freed or replaced
+    ///
+    /// A replay records no cudarc events on the buffers it touches, so until every
+    /// queued replay has finished, those buffers must stay allocated and be used only
+    /// on this GPU's stream, which orders work after the replay. Dropping the graph
+    /// does not wait for a replay. cudarc frees a buffer in order on the stream it was
+    /// allocated on, so a buffer allocated on this GPU's stream may simply be dropped;
+    /// synchronize this stream before touching a buffer from another stream or freeing
+    /// one allocated elsewhere. Buffers that `enqueue` allocates carry no events for
+    /// their whole life, so they too stay on this stream
+    ///
+    /// No other thread may use this GPU until the capture returns: the stream records
+    /// whatever any thread queues on it, so another thread's work would land in this
+    /// graph with buffers the caller does not control
+    pub unsafe fn capture<E: From<Error>>(
+        &self,
+        enqueue: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Option<Graph>, E> {
+        let stream = self.stream();
+        stream.synchronize().map_err(Error::from)?;
+        // SAFETY: every buffer the capture touches belongs to this GPU and is used on
+        // its one stream, after the synchronize above, so stream order alone keeps
+        // them consistent while tracking is off
+        let _tracking = unsafe { EventTrackingPause::new(self.context()) };
+        stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(Error::from)?;
+        let enqueued = enqueue();
+        // end the capture even on error, so a failed enqueue leaves the stream usable
+        let graph = stream.end_capture(CUgraphInstantiate_flags(0));
+        enqueued?;
+
+        let Some(graph) = graph.map_err(Error::from)? else {
+            return Ok(None);
+        };
+        // the driver ends an empty capture with a zero-node graph rather than none
+        Ok((node_count(&graph)? > 0).then_some(Graph(graph)))
+    }
+
+    /// Like [`Self::capture`], but an empty capture is [`Error::EmptyCapture`]
+    ///
+    /// # Safety
+    ///
+    /// The same contract as [`Self::capture`]
+    pub unsafe fn capture_nonempty<E: From<Error>>(
+        &self,
+        enqueue: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Graph, E> {
+        // SAFETY: the caller upholds the buffer contract for the returned graph
+        Ok(unsafe { self.capture(enqueue) }?.ok_or(Error::EmptyCapture)?)
+    }
+}
+
+/// Nodes in the captured graph's top level
+fn node_count(graph: &CudaGraph) -> Result<usize, Error> {
+    let mut count = 0;
+    // SAFETY: the graph is live for the call, and a null node array asks only for the
+    // count, which the driver writes to `count`
+    unsafe { cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut count) }.result()?;
+    Ok(count)
+}
+
+/// Turns off cudarc's per-buffer event tracking on a context until dropped
+///
+/// cudarc makes every buffer access wait on the event of the buffer's last write and
+/// record a new one. Inside a stream capture, waiting on an event recorded before the
+/// capture fails with `CUDA_ERROR_STREAM_CAPTURE_ISOLATION`. The flag belongs to the
+/// context object and is read at each access
+pub(crate) struct EventTrackingPause<'a> {
+    context: &'a CudaContext,
+    was_tracking: bool,
+}
+
+impl<'a> EventTrackingPause<'a> {
+    /// Pauses tracking on `context`
+    ///
+    /// # Safety
+    ///
+    /// While the pause lives, every buffer of `context` that is touched must be used on
+    /// one stream only, with no pending work from other streams, so stream order alone
+    /// provides the dependencies the events would have. A buffer allocated during the
+    /// pause never gets events, so it must stay on that stream for its whole life
+    pub(crate) unsafe fn new(context: &'a CudaContext) -> Self {
+        let was_tracking = context.is_event_tracking();
+        // SAFETY: the caller upholds the single-stream contract above
+        unsafe { context.disable_event_tracking() };
+        Self {
+            context,
+            was_tracking,
+        }
+    }
+}
+
+impl Drop for EventTrackingPause<'_> {
+    fn drop(&mut self) {
+        if self.was_tracking {
+            // SAFETY: restores the state from before the pause
+            unsafe { self.context.enable_event_tracking() };
+        }
+    }
+}

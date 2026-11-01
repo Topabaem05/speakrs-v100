@@ -1,0 +1,77 @@
+use std::process::Command;
+
+use color_eyre::eyre::Result;
+
+use crate::cmd::{project_root, run_cmd};
+use crate::python::{uv_run, uv_run_project};
+
+pub fn export() -> Result<()> {
+    uv_run(&["scripts/export_models.py", "fixtures/models"])?;
+    // native CPU and CUDA weights come from the ONNX models just exported
+    uv_run(&[
+        "--no-project",
+        "scripts/cuda/export_weights.py",
+        "--runtime-assets",
+        "fixtures/models",
+    ])?;
+
+    if cfg!(target_os = "macos") {
+        export_coreml()?;
+    }
+
+    Ok(())
+}
+
+pub fn export_coreml() -> Result<()> {
+    uv_run_project(
+        "scripts/native_coreml",
+        "scripts/native_coreml/convert_coreml.py",
+        &["--output-dir", "fixtures/models"],
+    )
+}
+
+pub fn compare_coreml() -> Result<()> {
+    uv_run_project(
+        "scripts/native_coreml",
+        "scripts/native_coreml/compare_coreml.py",
+        &["--output-dir", "fixtures/models"],
+    )
+}
+
+pub fn deploy() -> Result<()> {
+    let root = project_root();
+
+    let includes = [
+        "plda_*.npy",
+        "wespeaker-voxceleb-resnet34.min_num_samples.txt",
+        "segmentation-3.0.onnx",
+        "segmentation-3.0-b32.onnx",
+        "segmentation-3.0-b64.onnx",
+        "wespeaker-voxceleb-resnet34.onnx",
+        "wespeaker-voxceleb-resnet34.onnx.data",
+        "wespeaker-voxceleb-resnet34-b64.onnx",
+        "wespeaker-fbank.onnx",
+        "wespeaker-fbank-b32.onnx",
+        "wespeaker-voxceleb-resnet34-tail.onnx",
+        "wespeaker-voxceleb-resnet34-tail-b3.onnx",
+        "wespeaker-voxceleb-resnet34-tail-b32.onnx",
+        "segmentation-3.0*.mlmodelc/**",
+        "wespeaker-fbank*.mlmodelc/**",
+        "wespeaker-chunk-emb*.mlmodelc/**",
+        "wespeaker-voxceleb-resnet34-tail*.mlmodelc/**",
+        "wespeaker-multimask-tail.onnx",
+        "wespeaker-multimask-tail-b32.onnx",
+        "wespeaker-multimask-tail*.mlmodelc/**",
+        "segmentation-3.0.safetensors",
+        "wespeaker-multimask-tail.safetensors",
+    ];
+
+    let mut cmd = Command::new("hf");
+    cmd.args(["upload", "avencera/speakrs-models", "fixtures/models", "."]);
+    for pattern in includes {
+        cmd.args(["--include", pattern]);
+    }
+    cmd.current_dir(&root);
+
+    run_cmd(&mut cmd)
+}

@@ -1,0 +1,212 @@
+[workspace]
+members = [
+    "xtask",
+    "crates/speakrs-ptx-sm70",
+    "crates/speakrs-ptx-sm75",
+    "crates/speakrs-ptx-sm80",
+    "crates/speakrs-ptx-sm120",
+    "crates/speakrs-sdk",
+    "crates/speakrs-python",
+]
+exclude = ["scripts/", "crates/speakrs-cuda-kernels"]
+
+# shared by the kernel artifact crates, which release in lockstep with speakrs
+[workspace.package]
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/avencera/speakrs"
+authors = ["Praveen Perera"]
+
+[package]
+name = "speakrs"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.96"
+description = "Fast Rust speaker diarization with pyannote-level accuracy and native CPU/CoreML/CUDA inference"
+license = "Apache-2.0"
+repository = "https://github.com/avencera/speakrs"
+documentation = "https://docs.rs/speakrs"
+readme = "README.md"
+authors = ["Praveen Perera"]
+keywords = ["speaker", "diarization", "audio", "pyannote", "onnx"]
+categories = ["multimedia::audio", "science"]
+include = ["/src/**", "/examples/**", "/README.md", "/LICENSE", "/Cargo.toml"]
+
+[features]
+default = ["online"]
+# blocking Hub downloads through hf-fetch, with rustls and no async runtime
+online = ["hf-fetch/online"]
+cpu = ["dep:safetensors", "dep:rustfft", "dep:libloading", "_backend"]
+coreml = [
+    "dep:block2",
+    "dep:objc2",
+    "dep:objc2-core-ml",
+    "dep:objc2-foundation",
+    "_backend",
+]
+# Linux-only native NVIDIA backend; CUDA is never part of default
+# cuda defaults to speakrs kernels on every GPU, with cuDNN/cuBLAS fallback
+cuda = ["cuda-sm75", "cuda-sm80", "cuda-sm90", "cuda-sm120", "_cuda-libraries"]
+# internal: optional numerical libraries, added only by cuda
+_cuda-libraries = ["_cuda", "cudarc/cublas", "cudarc/cudnn", "cudakit/libraries"]
+# internal: driver support, without optional numerical libraries or kernel artifacts
+_cuda = ["dep:cudakit", "cudakit/serde", "dep:cudarc", "dep:libloading", "dep:safetensors", "dep:sha2", "dep:serde", "dep:serde_json", "dep:getrandom", "_backend"]
+# each target embeds every area's best shipped variant for that target, so it pulls in
+# the artifact crate of every tier it may use; areas without a newer variant use sm75
+# default-features = false with cuda-rtx50 alone is a driver-only build
+cuda-sm75 = ["_cuda", "dep:speakrs-ptx-sm75"]
+cuda-sm80 = ["_cuda", "dep:speakrs-ptx-sm75", "dep:speakrs-ptx-sm80"]
+cuda-sm90 = ["_cuda", "dep:speakrs-ptx-sm75", "dep:speakrs-ptx-sm80"]
+cuda-sm120 = ["_cuda", "dep:speakrs-ptx-sm75", "dep:speakrs-ptx-sm80", "dep:speakrs-ptx-sm120"]
+# Volta (V100), below the sm75 baseline: every area's sm70 variant, with the FP16 trunk
+# stubbed. Not part of `cuda` yet; alone it is a driver-only build, and with `cuda` it
+# also gets the cuDNN/cuBLAS fallback (cuDNN 9.10 is the last that supports Volta)
+cuda-sm70 = ["_cuda", "dep:speakrs-ptx-sm70"]
+# RTX 20: Turing; RTX 30: Ampere; RTX 40: Ada; A100: Ampere
+cuda-rtx20 = ["cuda-sm75"]
+cuda-rtx30 = ["cuda-sm80"]
+cuda-rtx40 = ["cuda-sm80"]
+cuda-a100 = ["cuda-sm80"]
+# RTX 50: consumer Blackwell
+cuda-rtx50 = ["cuda-sm120"]
+# V100: Volta
+cuda-v100 = ["cuda-sm70"]
+migraphx = ["_ort", "ort/migraphx", "_backend"]
+# load ONNX Runtime at run time for MIGraphX or caller-created CPU sessions
+# native CPU model execution does not use this runtime
+load-dynamic = ["_ort", "ort/load-dynamic", "dep:libloading"]
+
+# internal: ONNX Runtime support for MIGraphX and external session helpers
+_ort = ["dep:ort"]
+# internal: enabled by every inference backend; gates the crate items in `lib.rs`
+_backend = []
+_metrics = []
+
+[package.metadata.docs.rs]
+features = ["cpu", "cuda", "cuda-sm70", "cuda-sm75", "cuda-sm80", "cuda-sm90", "cuda-sm120", "migraphx", "load-dynamic", "_metrics"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
+getrandom = { version = "0.4", features = ["std"], optional = true }
+
+# math
+rustfft = { version = "6.4.1", optional = true }
+kodama = "0.3.0"
+ndarray = { version = "0.17.2", features = ["matrixmultiply-threading"] }
+# the default npz feature pulls in zip 6; tests read .npz captures with zip 9
+ndarray-npy = { version = "0.10.0", default-features = false }
+
+ort = { version = "2.0.0-rc.15", features = ["ndarray"], optional = true }
+
+# native CUDA: libcuda, cuBLAS and cuDNN are loaded at run time, so the crate builds
+# without a CUDA toolkit (including on macOS). The 12.4 API floor keeps the CUDA 12.4
+# canary image working; the PTX itself is JIT-compiled by the installed driver
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    # the precompiled `Ptx` type requires this feature but does not load NVRTC
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-12040",
+] }
+# the shared driver-only CUDA host stack; speakrs keeps its kernels, plans and policy
+cudakit = { version = "0.1", optional = true }
+safetensors = { version = "0.8.0", optional = true, default-features = false, features = ["alloc"] }
+# prebuilt PTX and cubins, one crate per tier so each stays under the crates.io upload
+# limit; exact pins because the host code and the kernels change together
+speakrs-ptx-sm70 = { version = "=0.7.0", path = "crates/speakrs-ptx-sm70", optional = true }
+speakrs-ptx-sm75 = { version = "=0.7.0", path = "crates/speakrs-ptx-sm75", optional = true }
+speakrs-ptx-sm80 = { version = "=0.7.0", path = "crates/speakrs-ptx-sm80", optional = true }
+speakrs-ptx-sm120 = { version = "=0.7.0", path = "crates/speakrs-ptx-sm120", optional = true }
+libloading = { version = "0.9.0", optional = true }
+
+# logging
+tracing = "0.1.44"
+
+# error handling
+thiserror = "2.0.21"
+
+# model downloads
+hf-fetch = { version = "0.1.2", default-features = false }
+
+# concurrency
+crossbeam-channel = "0.5"
+rayon = "1.12.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+block2 = { version = "0.6", optional = true }
+objc2-core-ml = { version = "0.3", optional = true, features = [
+    "MLModel",
+    "MLMultiArray",
+    "MLModelConfiguration",
+    "MLDictionaryFeatureProvider",
+    "MLFeatureValue",
+    "MLFeatureProvider",
+    "MLPredictionOptions",
+    "alloc",
+    "block2",
+] }
+
+objc2-foundation = { version = "0.3", optional = true, features = [
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSObject",
+    "NSString",
+    "NSURL",
+    "NSValue",
+    "NSSet",
+    "NSEnumerator",
+    "NSObjCRuntime",
+] }
+
+[[bin]]
+name = "speakrs"
+required-features = ["_cuda"]
+
+# the examples load native model assets in `ExecutionMode::Cpu`
+[[example]]
+name = "assign_transcript_speakers"
+required-features = ["cpu"]
+
+[[example]]
+name = "diarize_wav"
+required-features = ["cpu"]
+
+[[example]]
+name = "print_turns"
+required-features = ["cpu"]
+
+[[example]]
+name = "queued"
+required-features = ["cpu"]
+
+[[example]]
+name = "speaker_airtime"
+required-features = ["cpu"]
+
+[dev-dependencies]
+# device-attribute builders and fixture PTX for host-only CUDA tests
+cudakit = { version = "0.1", features = ["test-support"] }
+hound = "3.5.1"
+sha2 = "0.11"
+libloading = "0.9.0"
+approx = "0.5.1"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+serde_json = "1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tempfile = "3.27.0"
+
+# native model tests need optimized kernels; test assertions remain enabled
+[profile.test]
+opt-level = 2
+
+# local cudakit fork carrying the sm70 (V100) tier; see ../PLAN-v100.md
+[patch.crates-io]
+cudakit = { path = "../cudakit/crates/cudakit" }
+cudakit-build = { path = "../cudakit/crates/cudakit-build" }
