@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN"
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg xmlns:xlink="http://www.w3.org/1999/xlink" width="1080pt" height="208.8pt" viewBox="0 0 1080 208.8" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <metadata>
+  <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
+    <dc:date>2026-11-02T01:12:45.189638</dc:date>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.11.2, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 208.8 
+L 1080 208.8 
+L 1080 0 
+L 0 0 
+z
+" style="fill: #ffffff"/>
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 24.994667 136.133103 
+L 197.848667 136.133103 
+Q 203.539333 136.133103 203.539333 130.731724 
+L 203.539333 44.309655 
+Q 203.539333 38.908276 197.848667 38.908276 
+L 24.994667 38.908276 
+Q 19.304 38.908276 19.304 44.309655 
+L 19.304 130.731724 
+Q 19.304 136.133103 24.994667 136.133103 
+z
+" clip-path="url(#pe3da5fd398)" style="fill: #ffffff; stroke: #000000; stroke-width: 1.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_3">
+    <path d="M 238.394667 136.133103 
+L 411.248667 136.133103 
+Q 416.939333 136.133103 416.939333 130.731724 
+L 416.939333 44.309655 
+Q 416.939333 38.908276 411.248667 38.908276 
+L 238.394667 38.908276 
+Q 232.704 38.908276 232.704 44.309655 
+L 232.704 130.731724 
+Q 232.704 136.133103 238.394667 136.133103 
+z
+" clip-path="url(#pe3da5fd398)" style="fill: #ddf3de; stroke: #000000; stroke-width: 1.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_4">
+    <path d="M 204.113384 87.52069 
+Q 218.121659 87.52069 230.117472 87.52069 
+" clip-path="url(#pe3da5fd398)" style="fill: none; stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 223.717472 84.32069 
+L 230.117472 87.52069 
+L 223.717472 90.72069 
+z
+" clip-path="url(#pe3da5fd398)" style="stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_5">
+    <path d="M 451.794667 136.133103 
+L 624.648667 136.133103 
+Q 630.339333 136.133103 630.339333 130.731724 
+L 630.339333 44.309655 
+Q 630.339333 38.908276 624.648667 38.908276 
+L 451.794667 38.908276 
+Q 446.104 38.908276 446.104 44.309655 
+L 446.104 130.731724 
+Q 446.104 136.133103 451.794667 136.133103 
+z
+" clip-path="url(#pe3da5fd398)" style="fill: #aadca9; stroke: #000000; stroke-width: 1.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_6">
+    <path d="M 417.513384 87.52069 
+Q 431.521659 87.52069 443.517472 87.52069 
+" clip-path="url(#pe3da5fd398)" style="fill: none; stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 437.117472 84.32069 
+L 443.517472 87.52069 
+L 437.117472 90.72069 
+z
+" clip-path="url(#pe3da5fd398)" style="stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_7">
+    <path d="M 665.194667 136.133103 
+L 838.048667 136.133103 
+Q 843.739333 136.133103 843.739333 130.731724 
+L 843.739333 44.309655 
+Q 843.739333 38.908276 838.048667 38.908276 
+L 665.194667 38.908276 
+Q 659.504 38.908276 659.504 44.309655 
+L 659.504 130.731724 
+Q 659.504 136.133103 665.194667 136.133103 
+z
+" clip-path="url(#pe3da5fd398)" style="fill: #8bcf8b; stroke: #000000; stroke-width: 1.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_8">
+    <path d="M 630.913384 87.52069 
+Q 644.921659 87.52069 656.917472 87.52069 
+" clip-path="url(#pe3da5fd398)" style="fill: none; stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 650.517472 84.32069 
+L 656.917472 87.52069 
+L 650.517472 90.72069 
+z
+" clip-path="url(#pe3da5fd398)" style="stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="patch_9">
+    <path d="M 878.594667 136.133103 
+L 1051.448667 136.133103 
+Q 1057.139333 136.133103 1057.139333 130.731724 
+L 1057.139333 44.309655 
+Q 1057.139333 38.908276 1051.448667 38.908276 
+L 878.594667 38.908276 
+Q 872.904 38.908276 872.904 44.309655 
+L 872.904 130.731724 
+Q 872.904 136.133103 878.594667 136.133103 
+z
+" clip-path="url(#pe3da5fd398)" style="fill: #0f4d92; stroke: #000000; stroke-width: 1.8; stroke-linejoin: miter"/>
+   </g>
+   <g id="patch_10">
+    <path d="M 844.313384 87.52069 
+Q 858.321659 87.52069 870.317472 87.52069 
+" clip-path="url(#pe3da5fd398)" style="fill: none; stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+    <path d="M 863.917472 84.32069 
+L 870.317472 87.52069 
+L 863.917472 90.72069 
+z
+" clip-path="url(#pe3da5fd398)" style="stroke: #000000; stroke-width: 1.8; stroke-linecap: round"/>
+   </g>
+   <g id="text_1">
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(78.077604 84.095885)">Rust kernels</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(88.410729 97.156432)">#[kernel]</text>
+   </g>
+   <g id="text_2">
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(270.448542 84.095885)">cuda-oxide 918bbde</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(289.480729 97.156432)">--arch sm_70</text>
+   </g>
+   <g id="text_3">
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(505.538542 77.565494)">PTX ISA 6.0</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(492.371354 90.626041)">wmma + nounroll</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(517.879792 103.686588)">pragma</text>
+   </g>
+   <g id="text_4">
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(723.938229 77.565377)">ptxas 12.9</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(700.929167 90.625924)">(CUDA 13 dropped</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif" transform="translate(736.279479 103.686705)">Volta)</text>
+   </g>
+   <g id="text_5">
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif; fill: #ffffff" transform="translate(931.004479 84.095885)">sm_70 cubin</text>
+    <text style="font-size: 12px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif; fill: #ffffff" transform="translate(917.344167 97.156432)">speakrs-ptx-sm70</text>
+   </g>
+   <g id="text_6">
+    <text style="font-size: 11px; font-family: 'Arial', 'Helvetica', 'DejaVu Sans', 'Bitstream Vera Sans', 'Computer Modern Sans Serif', 'Lucida Grande', 'Verdana', 'Geneva', 'Lucid', 'Avant Garde', sans-serif; text-anchor: middle; fill: #4d4d4d" x="540" y="178.668966" transform="rotate(-0 540 178.668966)">sm75/sm80/sm120 tiers keep CUDA 13.0 ptxas and stay byte-identical; a lint rejects sm_75+ opcodes in sm70 PTX</text>
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pe3da5fd398">
+   <rect x="6.5" y="6.5" width="1067" height="195.8"/>
+  </clipPath>
+ </defs>
+</svg>
