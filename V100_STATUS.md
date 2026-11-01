@@ -89,7 +89,7 @@ batch 32 운영 커널을 Nsight Compute로 분석했다(SM 1.30GHz 고정).
 
 ### 5.4 정리와 공개
 
-- speakrs, cudakit fork의 변경을 커밋하고, GitHub(`Topabaem05/V100_fast_` 등)에 push할지 정해야 한다.
+- 2026-11-02에 speakrs fork(`ef71bde`)와 cudakit fork(`b489b99`)를 각 `v100-sm70` branch에 커밋했다. 두 fork의 파일을 모은 저장소를 https://github.com/Topabaem05/speakrs-v100 (`main`)에 push했다. 저장소의 원래 이름은 `V100_fast_`이다.
 - 정할 것이 두 가지 더 있다. `cuda-sm70`을 `cuda` 묶음에 넣을지, upstream(avencera/speakrs, cudakit)에 PR을 낼지다.
 - README의 GPU 표는 16코어 호스트에서 10개 파일 subset으로 잰 값이다. V100 행을 넣으려면 같은 조건으로 다시 재야 한다.
 
